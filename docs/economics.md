@@ -58,6 +58,17 @@ Target utilization: 60-80% (higher = more yield, higher tail risk).
 - Quorum: 10% of total SHIELD supply must vote
 - Majority: 51% of cast votes must be FOR
 
+### Proposal deposit refunds
+
+The proposer locks the configured threshold at creation. Failed proposals and
+admin-cancelled proposals refund the full locked amount. A passed proposal
+keeps its deposit escrowed through finalization until execution. The target may
+return a `u32` completion value in basis points (`0`–`10,000`); the DAO refunds
+that fraction of the original deposit and retains the rest. Existing targets
+that return unit or another non-`u32` value are treated as fully executed for
+backward compatibility. A target invocation that fails atomically produces no
+refund. Passed proposals that expire without execution retain the deposit.
+
 ## Risk Categories
 
 | Category | Premium Rate | Target APY | Max Coverage |

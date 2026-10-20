@@ -8,6 +8,25 @@ Oracle rotation is a three-step operation. The admin calls
 48-hour review period. A pending proposal cannot be replaced, an unapproved
 proposal cannot execute, and changing the guardian does not bypass the delay.
 
+## Claims processor guardian multisig
+
+The admin bootstraps the initial guardian set with `set_guardians`. Each
+non-empty set must have a threshold from 1 through the set size, and duplicate
+guardian addresses are rejected. After bootstrap, `set_guardians` only proposes
+a replacement; the currently configured threshold must approve it through
+`approve_guardian_config` before it takes effect. An active guardian set cannot
+be cleared or disabled by setting its threshold to zero. The initial
+admin-controlled bootstrap is the only configuration change that does not
+require approval from an existing set. `guardian_config_proposed` and
+`guardian_config_approved` report the change and approval progress;
+`guardians_updated` is emitted only when the change takes effect.
+
+## Policy expiration event
+
+When the authorized claims processor expires a policy, PolicyEngine emits the
+`policy_expired` event with a `PolicyExpired` payload containing `policy_id`
+(`u128`) and `timestamp` (`u64`, the current ledger timestamp).
+
 ## Claim dispute windows
 
 The claims processor defaults to a seven-day dispute window. The admin may set

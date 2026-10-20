@@ -2390,45 +2390,13 @@ impl OracleVerifier {
             return;
         }
 
-        // Load existing submissions for this (data_type, key)
-        let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
-        let points: Vec<OracleDataPoint> = env
-            .storage()
-            .persistent()
-            .get(&dp_key)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        // Overwrite existing submission from this oracle; append if new
         let new_point = OracleDataPoint {
             oracle: oracle.clone(),
             value,
             confidence,
             timestamp,
         };
-        // Prune stale or unregistered/inactive oracle entries first (max
-        // age loaded above for the stale-gate check is reused here).
-        let mut pruned_points: Vec<OracleDataPoint> = Vec::new(&env);
-        for i in 0..points.len() {
-            let p = points.get_unchecked(i);
-            if p.oracle == oracle {
-                continue; // will be replaced
-            }
-            if now.saturating_sub(p.timestamp) <= max_data_age {
-                let oracle_k = StorageKey::Oracle(data_type.clone(), p.oracle.clone());
-                if let Some(e) = env.storage().persistent().get::<_, OracleEntry>(&oracle_k) {
-                    if e.active {
-                        pruned_points.push_back(p);
-                    }
-                }
-            }
-        }
-        if pruned_points.len() >= MAX_DATA_POINTS {
-            pruned_points.pop_front();
-        }
-        pruned_points.push_back(new_point);
-
-        env.storage().persistent().set(&dp_key, &pruned_points);
-        env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        Self::store_plain_reading(&env, &data_type, &key, new_point, now, max_data_age);
 
         // Check cross-validation rules after storing new data
         Self::check_cross_validation(&env, &data_type, &key);
@@ -2557,7 +2525,7 @@ impl OracleVerifier {
         }
 
         let dp_key = StorageKey::EncryptedDataPoints(data_type.clone(), key.clone());
-        let mut points: Vec<EncryptedOracleDataPoint> = env
+        let points: Vec<EncryptedOracleDataPoint> = env
             .storage()
             .persistent()
             .get(&dp_key)
@@ -2570,22 +2538,29 @@ impl OracleVerifier {
             confidence,
             timestamp,
         };
-        let mut found = false;
+        let mut retained: Vec<EncryptedOracleDataPoint> = Vec::new(&env);
         for i in 0..points.len() {
-            if points.get_unchecked(i).oracle == oracle {
-                points.set(i, new_point.clone());
-                found = true;
-                break;
+            let point = points.get_unchecked(i);
+            if point.oracle == oracle || now.saturating_sub(point.timestamp) > max_data_age {
+                continue;
+            }
+            let oracle_key = StorageKey::Oracle(data_type.clone(), point.oracle.clone());
+            if env
+                .storage()
+                .persistent()
+                .get::<_, OracleEntry>(&oracle_key)
+                .map(|entry| entry.active)
+                .unwrap_or(false)
+            {
+                retained.push_back(point);
             }
         }
-        if !found {
-            if points.len() >= MAX_DATA_POINTS {
-                points.pop_front();
-            }
-            points.push_back(new_point);
+        while retained.len() >= MAX_DATA_POINTS {
+            retained.pop_front();
         }
+        retained.push_back(new_point);
 
-        env.storage().persistent().set(&dp_key, &points);
+        env.storage().persistent().set(&dp_key, &retained);
         env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         // Issue #459: fresh submission clears any accumulated stale count.
@@ -2609,6 +2584,14 @@ impl OracleVerifier {
         env.storage()
             .persistent()
             .get(&StorageKey::EncryptedDataPoints(data_type, key))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return the retained plaintext readings for (data_type, key).
+    pub fn get_data_points(env: Env, data_type: Symbol, key: Symbol) -> Vec<OracleDataPoint> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::DataPoints(data_type, key))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -3138,34 +3121,21 @@ impl OracleVerifier {
                 .get(&StorageKey::MaxTimestampAge)
                 .unwrap_or(90 * 24 * 60 * 60);
             if timestamp < now.saturating_sub(max_timestamp_age) {
-                panic_with_error!(&env, Error::InvalidTimestamp);
+            panic_with_error!(&env, Error::InvalidTimestamp);
             }
 
-            let dp_key = StorageKey::DataPoints(data_type.clone(), key.clone());
-            let mut points: Vec<OracleDataPoint> = env
-                .storage()
-                .persistent()
-                .get(&dp_key)
-                .unwrap_or_else(|| Vec::new(&env));
+            let max_data_age = Self::effective_max_age(&env, &data_type);
+            if now.saturating_sub(timestamp) > max_data_age {
+            Self::handle_stale_submission(&env, &oracle, &data_type, timestamp, max_data_age);
+            continue;
+            }
             let new_point = OracleDataPoint {
-                oracle: oracle.clone(),
-                value,
-                confidence,
-                timestamp,
+            oracle: oracle.clone(),
+            value,
+            confidence,
+            timestamp,
             };
-            let mut found = false;
-            for j in 0..points.len() {
-                if points.get_unchecked(j).oracle == oracle {
-                    points.set(j, new_point.clone());
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                points.push_back(new_point);
-            }
-                env.storage().persistent().set(&dp_key, &points);
-            env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            Self::store_plain_reading(&env, &data_type, &key, new_point, now, max_data_age);
 
             env.events().publish(
                 (Symbol::new(&env, "oracle_data_submitted"),),
@@ -3254,31 +3224,20 @@ impl OracleVerifier {
                 );
                 continue;
             }
-            let dp_key = StorageKey::DataPoints(data_type.clone(), sub.key.clone());
-            let mut points: Vec<OracleDataPoint> = env
-                .storage()
-                .persistent()
-                .get(&dp_key)
-                .unwrap_or_else(|| Vec::new(&env));
             let new_point = OracleDataPoint {
-                oracle: oracle.clone(),
-                value: sub.value,
-                confidence: sub.confidence,
-                timestamp: sub.timestamp,
+            oracle: oracle.clone(),
+            value: sub.value,
+            confidence: sub.confidence,
+            timestamp: sub.timestamp,
             };
-            let mut found = false;
-            for j in 0..points.len() {
-                if points.get_unchecked(j).oracle == oracle {
-                    points.set(j, new_point.clone());
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                points.push_back(new_point);
-            }
-                env.storage().persistent().set(&dp_key, &points);
-            env.storage().persistent().extend_ttl(&dp_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            Self::store_plain_reading(
+            &env,
+            &data_type,
+            &sub.key,
+            new_point,
+            now,
+            max_data_age,
+            );
 
             env.events().publish(
                 (Symbol::new(&env, "oracle_data_submitted"),),
@@ -3773,6 +3732,51 @@ impl OracleVerifier {
                     .get(&StorageKey::MinOracleCount)
                     .unwrap_or(1)
             })
+    }
+
+    /// Replace the oracle's previous reading and retain only fresh, active
+    /// oracle entries up to the per-key storage cap.
+    fn store_plain_reading(
+        env: &Env,
+        data_type: &Symbol,
+        key: &Symbol,
+        new_point: OracleDataPoint,
+        now: u64,
+        max_data_age: u64,
+    ) {
+        let storage_key = StorageKey::DataPoints(data_type.clone(), key.clone());
+        let points: Vec<OracleDataPoint> = env
+            .storage()
+            .persistent()
+            .get(&storage_key)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut retained = Vec::new(env);
+        for i in 0..points.len() {
+            let point = points.get_unchecked(i);
+            if point.oracle == new_point.oracle
+                || now.saturating_sub(point.timestamp) > max_data_age
+            {
+                continue;
+            }
+            let oracle_key = StorageKey::Oracle(data_type.clone(), point.oracle.clone());
+            if env
+                .storage()
+                .persistent()
+                .get::<_, OracleEntry>(&oracle_key)
+                .map(|entry| entry.active)
+                .unwrap_or(false)
+            {
+                retained.push_back(point);
+            }
+        }
+        while retained.len() >= MAX_DATA_POINTS {
+            retained.pop_front();
+        }
+        retained.push_back(new_point);
+        env.storage().persistent().set(&storage_key, &retained);
+        env.storage()
+            .persistent()
+            .extend_ttl(&storage_key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     /// Compute the weighted median of active, sufficiently fresh submissions.

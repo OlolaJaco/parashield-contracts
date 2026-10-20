@@ -20,7 +20,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
-    BytesN, Env, IntoVal, Symbol, Val, Vec,
+    BytesN, Env, IntoVal, Symbol, TryFromVal, Val, Vec,
 };
 
 pub mod types;
@@ -303,8 +303,9 @@ impl GovernanceDao {
     ///
     /// The proposer must hold at least `config.proposal_threshold` gov
     /// tokens; that exact amount is locked (transferred into the DAO) as a
-    /// deposit and is refunded verbatim by `finalize()`, regardless of any
-    /// later change to `config.proposal_threshold`.
+    /// deposit. Failed and cancelled proposals refund it in full. Passed
+    /// proposals retain it until execution, when the target's returned
+    /// completion basis points determine the proportional refund.
     pub fn create_proposal(
         env: Env,
         proposer: Address,
@@ -431,10 +432,8 @@ impl GovernanceDao {
         // Issue #519: pull the deposit only after every check and state write
         // above has succeeded, so a failure in proposal creation can never
         // leave the proposer's tokens locked without a matching proposal.
-        // Lock the exact amount that gated this proposal; finalize() refunds
-        // it verbatim from the Proposal record, so a later change to the
-        // base threshold or the multipliers does not distort refunds already
-        // in flight.
+        // Lock the exact amount that gated this proposal so later changes to
+        // the base threshold or multipliers cannot alter its refund basis.
         gov_token.transfer(
             &proposer,
             &env.current_contract_address(),
@@ -1115,8 +1114,9 @@ impl GovernanceDao {
     /// everyone abstained — has no majority to speak of and Fails, as does
     /// the exact-tie case (which lands at exactly 50%). Passing also
     /// starts the execution timelock (`execution_time = now +
-    /// proposal_timelock`). The proposer's original deposit is refunded in
-    /// both outcomes.
+    /// proposal_timelock`). Failed proposals receive their full deposit at
+    /// finalization; a passed proposal keeps it escrowed until execution so
+    /// the target's completion fraction can determine the proportional refund.
     pub fn finalize(env: Env, proposal_id: u64) {
         let mut proposal: Proposal = env
             .storage()
@@ -1193,14 +1193,15 @@ impl GovernanceDao {
         Self::record_participation(&env, total_votes, total_supply);
 
         let gov_token = token::Client::new(&env, &config.gov_token);
-        // Refund exactly what was locked at creation — never re-read the
-        // live config, which the admin can change after the proposer
-        // deposited (issue #137).
-        gov_token.transfer(
-            &env.current_contract_address(),
-            &proposal.proposer,
-            &proposal.deposit,
-        );
+        // Failed proposals do not execute, so release their entire deposit.
+        // Passed proposals keep it escrowed until execute() reports completion.
+        if proposal.status != ProposalStatus::Passed {
+            gov_token.transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &proposal.deposit,
+            );
+        }
 
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
@@ -1301,11 +1302,13 @@ impl GovernanceDao {
             let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
             Self::record_participation(&env, total_votes, total_supply);
 
-            gov_token.transfer(
-                &env.current_contract_address(),
-                &proposal.proposer,
-                &proposal.deposit,
-            );
+            if proposal.status != ProposalStatus::Passed {
+                gov_token.transfer(
+                    &env.current_contract_address(),
+                    &proposal.proposer,
+                    &proposal.deposit,
+                );
+            }
 
             env.storage()
                 .persistent()
@@ -1326,9 +1329,7 @@ impl GovernanceDao {
 
     /// Reclaim a proposer's deposit on a proposal that was never finalized.
     ///
-    /// `finalize()` is already permissionless and already refunds the
-    /// deposit regardless of whether quorum/majority was reached — but it
-    /// still requires *someone* to call it, and nobody is economically
+    /// Finalization is permissionless, but nobody is economically
     /// incentivized to spend a transaction finalizing a proposal that
     /// plainly failed quorum. Without this, such a deposit can sit locked
     /// indefinitely waiting on goodwill (issue #378).
@@ -1383,11 +1384,10 @@ impl GovernanceDao {
 
     /// Mark a Passed proposal as Executed once its timelock has expired.
     ///
-    /// Requires `status == Passed` and `now >= execution_time`. This
-    /// contract only flips the status flag — it does not itself perform the
-    /// cross-contract call to `target::function(args)`; the caller is
-    /// responsible for building the actual invocation and its auth tree, so
-    /// this contract never needs admin rights on the proposal's target.
+    /// Requires `status == Passed` and `now >= execution_time`. The target
+    /// invocation is atomic. A target may return completion basis points to
+    /// determine the proportional deposit refund; unit and non-u32 returns
+    /// retain the legacy full-refund behavior.
     pub fn execute(env: Env, proposal_id: u64) {
         let mut proposal: Proposal = env
             .storage()
@@ -1411,23 +1411,56 @@ impl GovernanceDao {
         if env.ledger().timestamp() < proposal.execution_time {
             panic_with_error!(&env, Error::TimelockNotExpired);
         }
-        // Check execution deadline: if passed, prevent execution to keep proposals fresh
+        // Persist expired proposals as terminal instead of panicking after the
+        // write (a panic would roll it back). Their unearned deposit remains
+        // withheld because no execution completed.
         if env.ledger().timestamp() > proposal.execution_deadline {
             proposal.status = ProposalStatus::Expired;
             env.storage()
                 .persistent()
                 .set(&StorageKey::Proposal(proposal_id), &proposal);
-            panic_with_error!(&env, Error::ExecutionDeadlineExpired);
+            Self::clear_proposal_hash(&env, &proposal);
+            env.events().publish(
+                (Symbol::new(&env, "proposal_expired"),),
+                proposal_id,
+            );
+            return;
         }
 
         // Validate target address is a valid Stellar address before execution
         // This is a defense-in-depth check to prevent targeting invalid contracts
         Self::validate_stellar_address(&env, &proposal.target);
 
-        // Perform actual cross-contract call to target::function(args)
-        // If the target contract doesn't exist or the function is invalid,
-        // this call will fail and the proposal won't be marked as executed
-        let _: Val = env.invoke_contract(&proposal.target, &proposal.function, proposal.args.clone());
+        // A target may return u32 basis points (0..=10,000) to report
+        // proportional completion. Existing unit/non-u32 returns remain
+        // compatible and count as full execution.
+        let result: Val = env.invoke_contract(&proposal.target, &proposal.function, proposal.args.clone());
+        let execution_bps = match u32::try_from_val(&env, &result) {
+            Ok(bps) if bps <= 10_000 => bps,
+            Ok(_) => panic_with_error!(&env, Error::InvalidInput),
+            Err(_) => 10_000,
+        };
+        let refund_amount = (proposal.deposit / 10_000) * execution_bps as i128
+            + ((proposal.deposit % 10_000) * execution_bps as i128) / 10_000;
+        if refund_amount > 0 {
+            let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+            token::Client::new(&env, &config.gov_token).transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &refund_amount,
+            );
+        }
+        env.events().publish(
+            (Symbol::new(&env, "proposal_deposit_refunded"),),
+            ProposalDepositRefunded {
+                proposal_id,
+                proposer: proposal.proposer.clone(),
+                deposit: proposal.deposit,
+                execution_bps,
+                refund_amount,
+                retained_amount: proposal.deposit - refund_amount,
+            },
+        );
 
         proposal.status = ProposalStatus::Executed;
         env.storage()

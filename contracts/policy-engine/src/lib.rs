@@ -1261,9 +1261,10 @@ impl PolicyEngine {
             .set(&StorageKey::Policy(policy_id), &policy);
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
 
+        let timestamp = env.ledger().timestamp();
         env.events().publish(
             (Symbol::new(&env, "policy_expired"),),
-            PolicyExpired { policy_id },
+            PolicyExpired { policy_id, timestamp },
         );
     }
 

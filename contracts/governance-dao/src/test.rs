@@ -24,6 +24,9 @@ pub struct MockTarget;
 impl MockTarget {
     pub fn update(_env: Env) {}
     pub fn upgrade(_env: Env) {}
+    pub fn partial(_env: Env) -> u32 {
+        5_000
+    }
 }
 
 pub fn setup() -> (
@@ -628,11 +631,10 @@ fn finalize_with_exactly_tied_votes_fails() {
     assert_eq!(p.status, ProposalStatus::Failed);
 }
 
-// ── Issue #137: finalize() must refund the deposit locked at creation ─────────
+// ── Issue #137: refund uses the deposit locked at creation ───────────────────
 
-/// Admin lowers proposal_threshold after a proposal is created but before
-/// finalize() runs. The proposer must still get back exactly what they
-/// locked at creation time, not the new (lower) live threshold.
+/// Admin lowers proposal_threshold after creation. Execution must refund the
+/// amount locked at creation, not the new (lower) live threshold.
 #[test]
 fn test_finalize_refunds_deposit_locked_at_creation_not_live_config() {
     let (env, dao, admin, voter1, voter2, target) = setup();
@@ -667,8 +669,11 @@ fn test_finalize_refunds_deposit_locked_at_creation_not_live_config() {
     dao.finalize(&pid);
     dao.withdraw_tokens(&voter1, &pid);
 
-    // Must have gotten back the full original deposit (10k SHIELD), not
-    // the live (lowered) threshold of 1 stroop.
+    // Passed proposals retain the deposit until execution.
+    assert_eq!(gov_token.balance(&voter1), balance_before - deposit_before);
+    dao.execute(&pid);
+
+    // Execution refunds the original deposit, not the live threshold.
     assert_eq!(gov_token.balance(&voter1), balance_before);
 
     let p = dao.get_proposal(&pid);
@@ -683,6 +688,7 @@ fn test_finalize_does_not_pull_raised_live_threshold() {
     let (env, dao, admin, voter1, voter2, target) = setup();
 
     let deposit_before: i128 = 10_000_0000000i128;
+    let balance_before = token::Client::new(&env, &dao.get_config().gov_token).balance(&voter1);
 
     let args: Vec<Val> = Vec::new(&env);
     let pid = dao.create_proposal(
@@ -704,12 +710,46 @@ fn test_finalize_does_not_pull_raised_live_threshold() {
     env.ledger()
         .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
 
-    // Must succeed — refunds the original deposit, not the raised threshold.
+    // Must succeed without refunding or re-reading the raised live threshold.
     dao.finalize(&pid);
+    dao.withdraw_tokens(&voter1, &pid);
 
     let p = dao.get_proposal(&pid);
     assert_eq!(p.deposit, deposit_before);
     assert_eq!(p.status, ProposalStatus::Passed);
+    assert_eq!(
+        token::Client::new(&env, &dao.get_config().gov_token).balance(&voter1),
+        balance_before - deposit_before,
+    );
+}
+
+#[test]
+fn partial_execution_refunds_deposit_proportionally() {
+    let (env, dao, _, voter1, voter2, target) = setup();
+    let gov_token = token::Client::new(&env, &dao.get_config().gov_token);
+    let balance_before = gov_token.balance(&voter1);
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Partial execution"),
+        &target,
+        &Symbol::new(&env, "partial"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: execution may be partial."),
+    );
+    let deposit = dao.get_proposal(&pid).deposit;
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+    dao.finalize(&pid);
+    dao.withdraw_tokens(&voter1, &pid);
+    assert_eq!(gov_token.balance(&voter1), balance_before - deposit);
+
+    dao.execute(&pid);
+    assert_eq!(gov_token.balance(&voter1), balance_before - deposit + deposit / 2);
+    assert_eq!(dao.get_proposal(&pid).status, ProposalStatus::Executed);
 }
 
 #[test]
@@ -1610,8 +1650,7 @@ fn non_admin_cannot_set_multipliers() {
 
 /// A Proposal's `deposit` field records the escalated amount at creation
 /// time and stays that way even if the admin later changes multipliers or
-/// the base threshold. `finalize()` refunds this exact amount, so an
-/// escalated proposer is not shortchanged by a mid-flight config edit.
+/// the base threshold. Execution uses this exact amount as its refund basis.
 ///
 /// This asserts the recorded value only; the crate has an existing (unrelated)
 /// test — `test_finalize_refunds_deposit_locked_at_creation_not_live_config`
@@ -1635,8 +1674,8 @@ fn escalated_deposit_locked_at_creation_time() {
     assert_eq!(dao.get_proposal(&pid).deposit, escalated_deposit);
 
     // Admin edits multipliers after creation. The Proposal's stored deposit
-    // must not change — finalize refunds what was locked, not what a fresh
-    // read of the multipliers would say now.
+    // must not change — refunds use what was locked, not what a fresh read
+    // of the multipliers would say now.
     dao.set_impact_multipliers(&admin, &10_000u32, &10_000u32, &10_000u32);
     assert_eq!(dao.get_proposal(&pid).deposit, escalated_deposit);
 }

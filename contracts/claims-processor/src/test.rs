@@ -1753,6 +1753,30 @@ fn set_guardians_with_positive_threshold_succeeds() {
 }
 
 #[test]
+fn changing_guardian_threshold_requires_current_threshold_approvals() {
+    let w = deploy();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let g1 = Address::generate(&w.env);
+    let g2 = Address::generate(&w.env);
+    let next_guardian = Address::generate(&w.env);
+    let current = Vec::from_array(&w.env, [g1.clone(), g2.clone()]);
+    cp.set_guardians(&w.admin, &current, &2u32);
+
+    let proposed = Vec::from_array(&w.env, [g1.clone(), next_guardian.clone()]);
+    cp.set_guardians(&w.admin, &proposed, &1u32);
+    assert_eq!(cp.get_guardian_threshold(), 2u32);
+    assert_eq!(cp.get_guardians(), current);
+    assert!(cp.get_pending_guardian_config().is_some());
+
+    cp.approve_guardian_config(&g1);
+    assert_eq!(cp.get_guardian_threshold(), 2u32);
+    cp.approve_guardian_config(&g2);
+    assert_eq!(cp.get_guardian_threshold(), 1u32);
+    assert_eq!(cp.get_guardians(), proposed);
+    assert!(cp.get_pending_guardian_config().is_none());
+}
+
+#[test]
 fn clear_guardians_with_zero_threshold_succeeds() {
     // Clearing guardians (empty vec, threshold=0) must still be allowed.
     let w = deploy();

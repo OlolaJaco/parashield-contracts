@@ -106,8 +106,10 @@ enum StorageKey {
     /// Guardian addresses authorized to approve critical actions (Vec<Address>).
     Guardians,
     /// Number of guardian approvals required to execute a critical action
-    /// (u32). 0 means guardian multisig is disabled (admin acts alone).
+    /// (u32). Zero is only valid before guardians are configured.
     GuardianThreshold,
+    /// Guardian set and threshold proposed by the admin, awaiting approval.
+    PendingGuardianConfig,
     /// A pending, not-yet-executed contract upgrade awaiting guardian approvals.
     PendingUpgrade,
     /// Seconds a claim may sit Pending before it can be escalated (u64).
@@ -1561,18 +1563,15 @@ impl ClaimsProcessor {
     }
 
     /// Configure the guardian set and approval threshold required for
-    /// critical actions (currently: contract upgrades). Admin-only.
-    /// `threshold == 0` disables the guardian requirement (default), so the
-    /// admin alone can act — preserves existing single-admin behavior until
-    /// guardians are explicitly configured.
+    /// critical actions (currently: contract upgrades). The first set is
+    /// bootstrapped by the admin; later changes require approval from the
+    /// current guardians through `approve_guardian_config`.
     pub fn set_guardians(env: Env, admin: Address, guardians: Vec<Address>, threshold: u32) {
         let stored_admin: Address = env.storage().instance().get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         if admin != stored_admin { panic_with_error!(&env, Error::Unauthorized); }
         admin.require_auth();
-        // A non-empty guardian set with threshold=0 would bypass multisig
-        // entirely while appearing configured (#608). Require at least one
-        // approval whenever guardians are active.
+
         if !guardians.is_empty() && threshold == 0 {
             panic_with_error!(&env, Error::InvalidThreshold);
         }
@@ -1621,7 +1620,7 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Return the current guardian approval threshold (0 = disabled).
+    /// Return the current guardian approval threshold (0 before bootstrap).
     pub fn get_guardian_threshold(env: Env) -> u32 {
         env.storage()
             .instance()
