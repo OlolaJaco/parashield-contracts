@@ -19,7 +19,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    token, Address, Env, IntoVal, Symbol, Val, Vec,
+    token, Address, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 pub mod types;
@@ -165,7 +165,12 @@ pub(crate) enum StorageKey {
     FeeTierList,
     /// Reentrancy guard flag to prevent reentrant external calls.
     ReentrancyGuard,
+    /// Human-readable pool name (issue #748).
+    PoolName,
 }
+
+/// Maximum pool name length in bytes/characters (issue #748).
+pub const MAX_POOL_NAME_LEN: u32 = 32;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -230,6 +235,8 @@ pub enum Error {
     PoolDrained               = 46,
     /// Reentrant call detected and blocked by reentrancy guard.
     Reentrancy                = 47,
+    /// Pool name exceeds maximum allowable length or is empty (issue #748).
+    NameTooLong               = 48,
 }
 
 /// RAII Reentrancy Guard that sets transient/instance lock on entry and cleans up on drop.
@@ -3178,6 +3185,20 @@ impl RiskPool {
                 amount,
             },
         );
+    }
+
+    /// Set or update the pool's human-readable name, enforcing length limits (issue #748).
+    pub fn set_pool_name(env: Env, admin: Address, name: String) {
+        Self::require_admin(&env, &admin);
+        if name.len() == 0 || name.len() > MAX_POOL_NAME_LEN {
+            panic_with_error!(&env, Error::NameTooLong);
+        }
+        env.storage().instance().set(&StorageKey::PoolName, &name);
+    }
+
+    /// Retrieve the pool's human-readable name if configured (issue #748).
+    pub fn get_pool_name(env: Env) -> Option<String> {
+        env.storage().instance().get(&StorageKey::PoolName)
     }
 }
 
