@@ -290,3 +290,15 @@ pub struct PolicyExpiringSoon {
     /// Seconds remaining until `end_time` at the moment of emission.
     pub seconds_remaining: u64,
 }
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CategoryRegistered {
+    pub category: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CategoryUnregistered {
+    pub category: Symbol,
+}

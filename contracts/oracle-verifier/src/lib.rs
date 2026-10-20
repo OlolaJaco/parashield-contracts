@@ -73,6 +73,9 @@ const MAX_DATA_VALUE: i128 = 1_000_000_000_000_000_000_000_000_000i128; // 10^27
 /// discard a legitimate value as a bad one.
 const DEFAULT_OUTLIER_MIN_SAMPLE_SIZE: u32 = 4;
 
+/// Default challenge period for stake withdrawals: 7 days in seconds (#681).
+pub const DEFAULT_CHALLENGE_PERIOD: u64 = 7 * 24 * 60 * 60;
+
 /// Default minimum number of seconds a single oracle must wait between
 /// submissions for the same data_type, used when no admin override has been
 /// set via `set_min_submit_interval`. Chosen well below any realistic
@@ -197,6 +200,10 @@ enum StorageKey {
     /// Validates submissions against data-type-specific bounds to prevent
     /// overflow in calculations specific to that data type.
     DataTypeRange(Symbol),
+    /// Challenge period in seconds before stake withdrawal can be executed (u64).
+    ChallengePeriod,
+    /// Pending stake withdrawal request for (data_type, oracle).
+    StakeWithdrawalReq(Symbol, Address),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -241,6 +248,12 @@ pub enum Error {
     InvalidSymbolLength = 31,
     /// The data_type is paused: submissions and trigger checks are refused.
     DataTypePaused = 32,
+    /// Challenge period has not elapsed yet (#681).
+    ChallengePeriodNotElapsed = 33,
+    /// No stake withdrawal request was found (#681).
+    NoStakeWithdrawalRequest = 34,
+    /// Stake withdrawal has already been requested (#681).
+    WithdrawalAlreadyRequested = 35,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -1623,12 +1636,41 @@ impl OracleVerifier {
         }
     }
 
-    /// Withdraw the caller's full stake for `data_type`. Only permitted once
-    /// the oracle is not an active registration for that data_type (never
-    /// registered, or previously removed via `remove_oracle`) — an active
-    /// oracle cannot pull its economic backing out from under a live
-    /// registration.
-    pub fn withdraw_stake(env: Env, oracle: Address, data_type: Symbol) {
+    // ── Stake Withdrawal Challenge Period & Slashing Protection (#681) ───────
+
+    /// Admin-only: configure the challenge period duration in seconds for stake withdrawals.
+    pub fn set_challenge_period(env: Env, admin: Address, period_seconds: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(&StorageKey::ChallengePeriod, &period_seconds);
+        env.events().publish(
+            (Symbol::new(&env, "challenge_period_updated"),),
+            ChallengePeriodUpdated { period_seconds },
+        );
+    }
+
+    /// Return the currently configured challenge period in seconds (defaults to 7 days).
+    pub fn get_challenge_period(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::ChallengePeriod)
+            .unwrap_or(DEFAULT_CHALLENGE_PERIOD)
+    }
+
+    /// Return an oracle's pending stake withdrawal request, if one exists.
+    pub fn get_stake_withdrawal_request(
+        env: Env,
+        data_type: Symbol,
+        oracle: Address,
+    ) -> Option<StakeWithdrawalRequest> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::StakeWithdrawalReq(data_type, oracle))
+    }
+
+    /// Request withdrawal of the caller's stake for `data_type`.
+    /// Starts a challenge period during which the stake remains subject to slashing
+    /// if fraudulent or malicious data is confirmed.
+    pub fn request_stake_withdrawal(env: Env, oracle: Address, data_type: Symbol) {
         oracle.require_auth();
 
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
@@ -1643,17 +1685,106 @@ impl OracleVerifier {
         if amount <= 0 {
             panic_with_error!(&env, Error::NoStake);
         }
+
+        let req_key = StorageKey::StakeWithdrawalReq(data_type.clone(), oracle.clone());
+        if env.storage().persistent().has(&req_key) {
+            panic_with_error!(&env, Error::WithdrawalAlreadyRequested);
+        }
+
+        let challenge_period = Self::get_challenge_period(env.clone());
+        let now = env.ledger().timestamp();
+        let unlock_at = now.saturating_add(challenge_period);
+
+        let req = StakeWithdrawalRequest {
+            oracle: oracle.clone(),
+            data_type: data_type.clone(),
+            amount,
+            requested_at: now,
+            unlock_at,
+        };
+        env.storage().persistent().set(&req_key, &req);
+        env.storage()
+            .persistent()
+            .extend_ttl(&req_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "stake_withdrawal_requested"),),
+            StakeWithdrawalRequested {
+                oracle,
+                data_type,
+                amount,
+                unlock_at,
+            },
+        );
+    }
+
+    /// Cancel an outstanding stake withdrawal request.
+    pub fn cancel_stake_withdrawal(env: Env, oracle: Address, data_type: Symbol) {
+        oracle.require_auth();
+
+        let req_key = StorageKey::StakeWithdrawalReq(data_type.clone(), oracle.clone());
+        if !env.storage().persistent().has(&req_key) {
+            panic_with_error!(&env, Error::NoStakeWithdrawalRequest);
+        }
+        env.storage().persistent().remove(&req_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "stake_withdrawal_cancelled"),),
+            StakeWithdrawalCancelled { oracle, data_type },
+        );
+    }
+
+    /// Complete a stake withdrawal after the challenge period has elapsed (#681).
+    /// If bad data was submitted and slashed during the challenge period, the oracle
+    /// can only withdraw whatever remaining stake is left after the slash deduction.
+    pub fn withdraw_stake(env: Env, oracle: Address, data_type: Symbol) {
+        oracle.require_auth();
+
+        let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
+        if let Some(entry) = env.storage().persistent().get::<_, OracleEntry>(&oracle_key) {
+            if entry.active {
+                panic_with_error!(&env, Error::OracleStillActive);
+            }
+        }
+
+        let req_key = StorageKey::StakeWithdrawalReq(data_type.clone(), oracle.clone());
+        let req: StakeWithdrawalRequest = env
+            .storage()
+            .persistent()
+            .get(&req_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoStakeWithdrawalRequest));
+
+        let now = env.ledger().timestamp();
+        if now < req.unlock_at {
+            panic_with_error!(&env, Error::ChallengePeriodNotElapsed);
+        }
+
+        let stake_key = StorageKey::OracleStakeAmt(data_type.clone(), oracle.clone());
+        let current: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
+        if current <= 0 {
+            env.storage().persistent().remove(&req_key);
+            panic_with_error!(&env, Error::NoStake);
+        }
+
+        let to_withdraw = current.min(req.amount);
+        let remaining = current - to_withdraw;
+        if remaining == 0 {
+            env.storage().persistent().remove(&stake_key);
+        } else {
+            env.storage().persistent().set(&stake_key, &remaining);
+        }
+        env.storage().persistent().remove(&req_key);
+
         let token_addr: Address = env
             .storage()
             .instance()
             .get(&StorageKey::StakeToken)
             .unwrap_or_else(|| panic_with_error!(&env, Error::StakeTokenNotSet));
 
-        env.storage().persistent().remove(&stake_key);
         token::Client::new(&env, &token_addr).transfer(
             &env.current_contract_address(),
             &oracle,
-            &amount,
+            &to_withdraw,
         );
 
         env.events().publish(
@@ -1661,18 +1792,16 @@ impl OracleVerifier {
             StakeWithdrawn {
                 oracle,
                 data_type,
-                amount,
+                amount: to_withdraw,
             },
         );
     }
 
     /// Slash `amount` from `oracle`'s stake for `data_type` as a penalty for
     /// provably incorrect data (verified off-chain / via governance and
-    /// submitted by the admin). Caps at the oracle's current stake. If the
-    /// slash brings the oracle below the configured `min_stake`, the oracle
-    /// is deactivated so it can no longer submit until it re-stakes and is
-    /// re-registered. Slashed funds move to the configured slash treasury,
-    /// if any, otherwise remain locked in the contract.
+    /// submitted by the admin). Caps at the oracle's current stake. If a
+    /// stake withdrawal is pending in its challenge period, the pending withdrawal
+    /// amount is also reduced accordingly (#681).
     pub fn slash_oracle(
         env: Env,
         admin: Address,
@@ -1694,6 +1823,17 @@ impl OracleVerifier {
         let slashed = amount.min(current);
         let remaining = current - slashed;
         env.storage().persistent().set(&stake_key, &remaining);
+
+        // Slashing protection: adjust any pending stake withdrawal request during challenge period
+        let req_key = StorageKey::StakeWithdrawalReq(data_type.clone(), oracle.clone());
+        if let Some(mut req) = env.storage().persistent().get::<_, StakeWithdrawalRequest>(&req_key) {
+            req.amount = req.amount.saturating_sub(slashed);
+            if req.amount <= 0 {
+                env.storage().persistent().remove(&req_key);
+            } else {
+                env.storage().persistent().set(&req_key, &req);
+            }
+        }
 
         if let Some(token_addr) = env.storage().instance().get::<_, Address>(&StorageKey::StakeToken) {
             if let Some(treasury) = env.storage().instance().get::<_, Address>(&StorageKey::SlashTreasury) {
@@ -2875,6 +3015,27 @@ impl OracleVerifier {
         }
         
         result
+    }
+
+    /// Batch-verify multiple oracle readings in a single invocation (#683).
+    /// Eliminates per-reading cross-contract call overhead for complex claims.
+    pub fn batch_verify_fresh(
+        env: Env,
+        queries: Vec<OracleReadingQuery>,
+    ) -> Vec<bool> {
+        let mut results = Vec::new(&env);
+        for i in 0..queries.len() {
+            let q = queries.get_unchecked(i);
+            let res = Self::verify_trigger_fresh(
+                env.clone(),
+                q.data_type,
+                q.key,
+                q.condition,
+                q.staleness_threshold,
+            );
+            results.push_back(res);
+        }
+        results
     }
 
     /// Submit data for multiple keys in one call.

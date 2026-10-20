@@ -645,3 +645,46 @@ pub struct StaleSlashAmountUpdated {
 pub struct StaleReputationPenaltyUpdated {
     pub reputation_lost: u32,
 }
+
+/// A stake withdrawal request subjected to a challenge period (#681).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StakeWithdrawalRequest {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    pub amount: i128,
+    pub requested_at: u64,
+    pub unlock_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StakeWithdrawalRequested {
+    pub oracle: Address,
+    pub data_type: Symbol,
+    pub amount: i128,
+    pub unlock_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StakeWithdrawalCancelled {
+    pub oracle: Address,
+    pub data_type: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChallengePeriodUpdated {
+    pub period_seconds: u64,
+}
+
+/// Query item for batch oracle verification (#683).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleReadingQuery {
+    pub data_type: Symbol,
+    pub key: Symbol,
+    pub condition: TriggerCondition,
+    pub staleness_threshold: u64,
+}

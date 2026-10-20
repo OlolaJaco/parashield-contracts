@@ -89,6 +89,10 @@ enum StorageKey {
     OracleGuardian,
     /// Proposed oracle rotation waiting for approval and its timelock.
     PendingOracleChange,
+    /// Maps category Symbol -> bool (whether registered)
+    RegisteredCategory(Symbol),
+    /// Vec<Symbol> of all registered categories
+    CategoryRegistry,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -260,6 +264,26 @@ impl PolicyEngine {
         // No pending admin initially
         env.storage().instance().remove(&StorageKey::PendingAdmin);
 
+        // Initialize default registered categories (#682)
+        let default_categories = soroban_sdk::vec![
+            &env,
+            symbol_short!("crop"),
+            symbol_short!("flight"),
+            symbol_short!("disaster"),
+            symbol_short!("health"),
+            symbol_short!("defi"),
+        ];
+        for i in 0..default_categories.len() {
+            let cat = default_categories.get_unchecked(i);
+            env.storage()
+                .persistent()
+                .set(&StorageKey::RegisteredCategory(cat.clone()), &true);
+            Self::extend_to_max(&env, &StorageKey::RegisteredCategory(cat));
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::CategoryRegistry, &default_categories);
+
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
             Initialized {
@@ -398,14 +422,9 @@ impl PolicyEngine {
     pub fn create_product(env: Env, admin: Address, params: CreateProductParams) -> u128 {
         Self::require_admin(&env, &admin);
 
-        // Only the supported product categories are accepted (issue #549).
+        // Only registered product categories are accepted (issue #682).
         let category = &params.category;
-        if *category != symbol_short!("crop")
-            && *category != symbol_short!("flight")
-            && *category != symbol_short!("disaster")
-            && *category != symbol_short!("health")
-            && *category != symbol_short!("defi")
-        {
+        if !Self::is_category_registered(env.clone(), category.clone()) {
             panic_with_error!(&env, Error::InvalidCategory);
         }
 
@@ -1332,6 +1351,80 @@ impl PolicyEngine {
             .persistent()
             .get(&StorageKey::PoolProductCount(category))
             .unwrap_or(0)
+    }
+
+    // ── Category Registry (issue #682) ────────────────────────────────────────
+
+    /// Admin-only: register a new product category in the protocol category registry.
+    pub fn register_category(env: Env, admin: Address, category: Symbol) {
+        Self::require_admin(&env, &admin);
+
+        let key = StorageKey::RegisteredCategory(category.clone());
+        if !env.storage().persistent().get(&key).unwrap_or(false) {
+            env.storage().persistent().set(&key, &true);
+            Self::extend_to_max(&env, &key);
+
+            let mut categories: Vec<Symbol> = env
+                .storage()
+                .instance()
+                .get(&StorageKey::CategoryRegistry)
+                .unwrap_or_else(|| Vec::new(&env));
+            categories.push_back(category.clone());
+            env.storage().instance().set(&StorageKey::CategoryRegistry, &categories);
+
+            env.events().publish(
+                (Symbol::new(&env, "category_registered"),),
+                CategoryRegistered { category },
+            );
+        }
+    }
+
+    /// Admin-only: unregister an existing product category.
+    pub fn unregister_category(env: Env, admin: Address, category: Symbol) {
+        Self::require_admin(&env, &admin);
+
+        let key = StorageKey::RegisteredCategory(category.clone());
+        if !env.storage().persistent().get(&key).unwrap_or(false) {
+            panic_with_error!(&env, Error::InvalidCategory);
+        }
+
+        env.storage().persistent().set(&key, &false);
+        Self::extend_to_max(&env, &key);
+
+        let categories: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::CategoryRegistry)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut updated: Vec<Symbol> = Vec::new(&env);
+        for i in 0..categories.len() {
+            let cat = categories.get_unchecked(i);
+            if cat != category {
+                updated.push_back(cat);
+            }
+        }
+        env.storage().instance().set(&StorageKey::CategoryRegistry, &updated);
+
+        env.events().publish(
+            (Symbol::new(&env, "category_unregistered"),),
+            CategoryUnregistered { category },
+        );
+    }
+
+    /// Return true if `category` is currently registered.
+    pub fn is_category_registered(env: Env, category: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::RegisteredCategory(category))
+            .unwrap_or(false)
+    }
+
+    /// Return all currently registered product categories.
+    pub fn get_registered_categories(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::CategoryRegistry)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // ── Admin: emergency controls ─────────────────────────────────────────────

@@ -163,6 +163,8 @@ pub(crate) enum StorageKey {
     FeeTier(Symbol),
     /// Names of all registered fee tiers (Vec<Symbol>).
     FeeTierList,
+    /// Reentrancy guard flag to prevent reentrant external calls.
+    ReentrancyGuard,
 }
 
 #[contracterror]
@@ -226,6 +228,27 @@ pub enum Error {
     ExitDelayTooLong          = 45,
     /// No liquid capital remains for a withdrawal.
     PoolDrained               = 46,
+    /// Reentrant call detected and blocked by reentrancy guard.
+    Reentrancy                = 47,
+}
+
+/// RAII Reentrancy Guard that sets transient/instance lock on entry and cleans up on drop.
+pub(crate) struct ReentrancyGuard(Env);
+
+impl ReentrancyGuard {
+    pub(crate) fn enter(env: &Env) -> Self {
+        if env.storage().instance().has(&StorageKey::ReentrancyGuard) {
+            panic_with_error!(env, Error::Reentrancy);
+        }
+        env.storage().instance().set(&StorageKey::ReentrancyGuard, &true);
+        Self(env.clone())
+    }
+}
+
+impl Drop for ReentrancyGuard {
+    fn drop(&mut self) {
+        self.0.storage().instance().remove(&StorageKey::ReentrancyGuard);
+    }
 }
 
 #[contract]
@@ -355,6 +378,7 @@ impl RiskPool {
         min_shares: i128,
         compound_enabled: bool,
     ) -> i128 {
+        let _guard = ReentrancyGuard::enter(&env);
         // SECURITY FIX: Validate address format before processing to prevent
         // deposits from being locked at invalid addresses
         Self::validate_stellar_address(&env, &provider);
@@ -557,12 +581,13 @@ impl RiskPool {
     /// transferred. Panics with `Undercollateralized` if the available (unlocked) liquidity
     /// is insufficient to cover the redemption.
     pub fn withdraw(env: Env, provider: Address, shares: i128) -> i128 {
+        let _guard = ReentrancyGuard::enter(&env);
         provider.require_auth();
         if shares <= 0 {
             panic_with_error!(&env, Error::ZeroAmount);
         }
         Self::sweep_expired_exits(&env, MAX_AUTO_EXIT_SCAN, Some(&provider));
-        Self::withdraw_inner(env, provider, shares)
+        Self::withdraw_inner(env.clone(), provider, shares)
     }
 
     /// Settlement body shared by `withdraw` and `claim_exit`.
@@ -651,6 +676,7 @@ impl RiskPool {
     /// Emergency LP withdrawal with explicit admin approval.
     /// Bypasses pool pause/winding-down status, but still only releases unlocked liquidity.
     pub fn emergency_withdraw(env: Env, provider: Address, admin: Address, shares: i128) -> i128 {
+        let _guard = ReentrancyGuard::enter(&env);
         provider.require_auth();
         Self::require_admin(&env, &admin);
         if shares <= 0 {
@@ -850,6 +876,7 @@ impl RiskPool {
     /// Pull `amount` USDC from `caller` and split it among LPs, treasury, and backstop
     /// according to the protocol fee schedule. No-op if `amount` is zero or negative.
     pub fn receive_premium(env: Env, caller: Address, amount: i128) {
+        let _guard = ReentrancyGuard::enter(&env);
         caller.require_auth();
         if amount <= 0 { return; }
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
@@ -861,14 +888,7 @@ impl RiskPool {
         let treas_share    = amount * treas_bps    / 10_000;
         let backstop_share = amount * backstop_bps / 10_000;
 
-        let treasury: Address = env.storage().instance().get(&StorageKey::Treasury).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&env.current_contract_address(), &treasury, &treas_share);
-
-        let backstop: Address = env.storage().instance().get(&StorageKey::Backstop).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&env.current_contract_address(), &backstop, &backstop_share);
-
+        // CEI: update state before outgoing external token transfers
         let acc: i128 = env.storage().instance()
             .get(&StorageKey::AccumulatedPremium).unwrap_or(0);
         env.storage().instance().set(&StorageKey::AccumulatedPremium, &(acc + lp_share));
@@ -889,6 +909,14 @@ impl RiskPool {
             .get(&StorageKey::AccumulatedBackstop).unwrap_or(0);
         env.storage().instance().set(&StorageKey::AccumulatedBackstop, &(acc_backstop + backstop_share));
 
+        let treasury: Address = env.storage().instance().get(&StorageKey::Treasury).unwrap();
+        token::Client::new(&env, &usdc)
+            .transfer(&env.current_contract_address(), &treasury, &treas_share);
+
+        let backstop: Address = env.storage().instance().get(&StorageKey::Backstop).unwrap();
+        token::Client::new(&env, &usdc)
+            .transfer(&env.current_contract_address(), &backstop, &backstop_share);
+
         env.events().publish(
             (Symbol::new(&env, "premium_distributed"),),
             PremiumDistributed {
@@ -903,6 +931,7 @@ impl RiskPool {
     /// Send a specified amount of USDC from the pool to the treasury address.
     /// Called by the backend after each policy purchase to distribute earned premiums.
     pub fn send_premium_to_treasury(env: Env, caller: Address, amount: i128) {
+        let _guard = ReentrancyGuard::enter(&env);
         Self::require_admin(&env, &caller);
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
@@ -918,6 +947,7 @@ impl RiskPool {
     /// Send a specified amount of USDC from the pool to the backstop address.
     /// Called by the backend after each policy purchase to distribute earned premiums.
     pub fn send_premium_to_backstop(env: Env, caller: Address, amount: i128) {
+        let _guard = ReentrancyGuard::enter(&env);
         Self::require_admin(&env, &caller);
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
@@ -939,6 +969,7 @@ impl RiskPool {
     /// Collect accumulated premium yield for `provider` and transfer it in USDC.
     /// Returns the amount claimed. No-op (returns 0) if no yield has accrued.
     pub fn claim_yield(env: Env, provider: Address) -> i128 {
+        let _guard = ReentrancyGuard::enter(&env);
         provider.require_auth();
         let lp_key = StorageKey::LpPosition(provider.clone());
         let mut position: LpPosition = env.storage().persistent()
@@ -1101,6 +1132,7 @@ impl RiskPool {
     /// must still cover the summed exit; otherwise the existing entry is
     /// left untouched and the call reverts with `InsufficientFunds`.
     pub fn request_exit(env: Env, provider: Address, shares: i128) {
+        let _guard = ReentrancyGuard::enter(&env);
         provider.require_auth();
         if shares <= 0 {
             panic_with_error!(&env, Error::ZeroAmount);
@@ -1178,6 +1210,7 @@ impl RiskPool {
     /// whether the pool takes a loss in the meantime — that would hand queued
     /// LPs an option paid for by everyone else.
     pub fn claim_exit(env: Env, provider: Address) -> i128 {
+        let _guard = ReentrancyGuard::enter(&env);
         provider.require_auth();
 
         let req_key = StorageKey::ExitReq(provider.clone());
@@ -1219,6 +1252,7 @@ impl RiskPool {
     /// starting from a rotating cursor and returns how many exits were settled.
     /// Requests the pool cannot currently afford stay queued for a later pass.
     pub fn process_expired_exits(env: Env, max_scan: u32) -> u32 {
+        let _guard = ReentrancyGuard::enter(&env);
         Self::sweep_expired_exits(&env, max_scan.min(MAX_AUTO_EXIT_SCAN), None)
     }
 
@@ -1228,6 +1262,7 @@ impl RiskPool {
     /// their mind should not be forced out, and a queue nobody can leave is a
     /// worse trap than the instant withdrawals it replaced.
     pub fn cancel_exit(env: Env, provider: Address) {
+        let _guard = ReentrancyGuard::enter(&env);
         provider.require_auth();
 
         let req_key = StorageKey::ExitReq(provider.clone());
@@ -1504,20 +1539,22 @@ impl RiskPool {
     /// `send_premium_to_backstop` — called by the admin (typically from an
     /// off-chain job) after premium income has accrued in the pool.
     pub fn send_premium_to_reinsurer(env: Env, caller: Address, amount: i128) {
+        let _guard = ReentrancyGuard::enter(&env);
         Self::require_admin(&env, &caller);
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         let config: ReinsuranceConfig = env.storage().instance()
             .get(&StorageKey::Reinsurance)
             .unwrap_or_else(|| panic_with_error!(&env, Error::ReinsuranceNotConfigured));
 
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&env.current_contract_address(), &config.reinsurer, &amount);
-
+        // CEI: update state before external transfer
         let paid: i128 = env.storage().instance()
             .get(&StorageKey::ReinsurancePremiumPaid).unwrap_or(0);
         let total_premium_paid = paid.saturating_add(amount);
         env.storage().instance().set(&StorageKey::ReinsurancePremiumPaid, &total_premium_paid);
+
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        token::Client::new(&env, &usdc)
+            .transfer(&env.current_contract_address(), &config.reinsurer, &amount);
 
         env.events().publish(
             (Symbol::new(&env, "reinsurance_premium_paid"),),
@@ -1547,6 +1584,7 @@ impl RiskPool {
         policy_id: u128,
         loss_amount: i128,
     ) -> i128 {
+        let _guard = ReentrancyGuard::enter(&env);
         Self::require_protocol_caller(&env, &caller);
         if loss_amount <= 0 { return 0; }
 
@@ -2204,6 +2242,7 @@ impl RiskPool {
     /// Execute a previously requested admin withdrawal after the 7-day timelock.
     /// Funds are transferred to the treasury address.
     pub fn execute_admin_withdrawal(env: Env, admin: Address) {
+        let _guard = ReentrancyGuard::enter(&env);
         Self::require_admin(&env, &admin);
         let req: AdminWithdrawalRequest = env.storage().persistent()
             .get(&StorageKey::AdminWithdrawalRequest)
@@ -2223,11 +2262,7 @@ impl RiskPool {
         let available = Self::get_available_liquidity(env.clone());
         if req.amount > available { panic_with_error!(&env, Error::Undercollateralized); }
 
-        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        let treasury: Address = env.storage().instance().get(&StorageKey::Treasury).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&env.current_contract_address(), &treasury, &req.amount);
-
+        // CEI: Persist state changes before external transfer
         let mut req = req;
         req.executed = true;
         env.storage().persistent().set(&StorageKey::AdminWithdrawalRequest, &req);
@@ -2237,6 +2272,11 @@ impl RiskPool {
             .get(&StorageKey::TotalDeposited).unwrap_or(0);
         env.storage().instance()
             .set(&StorageKey::TotalDeposited, &(total_deposited.saturating_sub(req.amount)));
+
+        let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
+        let treasury: Address = env.storage().instance().get(&StorageKey::Treasury).unwrap();
+        token::Client::new(&env, &usdc)
+            .transfer(&env.current_contract_address(), &treasury, &req.amount);
 
         env.events().publish(
             (Symbol::new(&env, "admin_withdrawal_executed"),),
@@ -3151,3 +3191,5 @@ mod test_edge;
 mod test_exit_queue;
 #[cfg(test)]
 mod test_reinsurance;
+#[cfg(test)]
+mod test_reentrancy;
