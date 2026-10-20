@@ -2117,7 +2117,7 @@ impl RiskPool {
     /// passed/executed proposal — a real design decision, not made here.
     pub fn update_premium_split(env: Env, admin: Address, lp_bps: i128, treas_bps: i128, backstop_bps: i128) {
         Self::require_admin(&env, &admin);
-        if lp_bps < 0 || treas_bps < 0 || backstop_bps < 0 {
+        if lp_bps < 0 || lp_bps > 10_000 || treas_bps < 0 || treas_bps > 10_000 || backstop_bps < 0 || backstop_bps > 10_000 {
             panic_with_error!(&env, Error::InvalidSplit);
         }
         if lp_bps + treas_bps + backstop_bps != 10_000 {
@@ -2141,7 +2141,7 @@ impl RiskPool {
         backstop_bps: i128,
     ) {
         Self::require_admin(&env, &admin);
-        if lp_bps < 0 || treas_bps < 0 || backstop_bps < 0 {
+        if lp_bps < 0 || lp_bps > 10_000 || treas_bps < 0 || treas_bps > 10_000 || backstop_bps < 0 || backstop_bps > 10_000 {
             panic_with_error!(&env, Error::InvalidSplit);
         }
         if lp_bps + treas_bps + backstop_bps != 10_000 {

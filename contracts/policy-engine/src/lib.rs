@@ -1085,7 +1085,10 @@ impl PolicyEngine {
     pub fn cancel_policy(env: Env, policyholder: Address, policy_id: u128, reason: soroban_sdk::Bytes) -> i128 {
         policyholder.require_auth();
 
-        // Validate reason length to prevent storage exhaustion from extremely long reasons
+        // Validate reason length to prevent storage exhaustion from extremely long reasons (issue #724)
+        if reason.is_empty() {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
         const MAX_REASON_LENGTH: u32 = 256;
         if reason.len() > MAX_REASON_LENGTH {
             panic_with_error!(&env, Error::ReasonTooLong);
