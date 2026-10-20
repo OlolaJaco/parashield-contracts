@@ -2157,7 +2157,8 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
 
         // Re-check the cap at release time: the payout may never exceed the
-        // policy's coverage amount (issue #550).
+        // policy's coverage amount (issue #550, #723).
+        // Accepts paid_amount == claim.coverage_amount; rejects strictly if paid_amount > claim.coverage_amount.
         if paid_amount > claim.coverage_amount {
             panic_with_error!(&env, Error::PayoutExceedsCoverage);
         }

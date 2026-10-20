@@ -347,9 +347,8 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::TooManyOracles);
         }
         
-        // Enforce a minimum economic stake so oracles have skin in the game.
-        // Disabled by default (min_stake == 0) for backward compatibility with
-        // deployments/tests that don't use the staking feature.
+        // Enforce a minimum economic stake so oracles have skin in the game (issue #721).
+        // Reject zero-stake registration when minimum stake is enforced.
         let min_stake: i128 = env
             .storage()
             .instance()
@@ -361,7 +360,7 @@ impl OracleVerifier {
                 .persistent()
                 .get(&StorageKey::OracleStakeAmt(data_type.clone(), oracle.clone()))
                 .unwrap_or(0);
-            if staked < min_stake {
+            if staked <= 0 || staked < min_stake {
                 panic_with_error!(&env, Error::InsufficientStake);
             }
         }
