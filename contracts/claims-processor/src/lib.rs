@@ -144,6 +144,10 @@ enum StorageKey {
     DisputeWindow,
     /// Claim reference number mapping: reference_number (Symbol) -> claim_id (u128) (issue #754).
     ClaimReference(Symbol),
+    /// Custom dispute deadline for a claim: claim_id (u128) -> deadline (u64) (issue #740).
+    ClaimDisputeDeadline(u128),
+    /// Per-user last claim submission timestamp: claimant (Address) -> timestamp (u64) (issue #737).
+    UserLastClaim(Address),
 }
 
 /// Maximum number of evidence files allowed per claim (issue #747).
@@ -217,6 +221,8 @@ pub enum Error {
     DisputeWindowExpired = 36,
     /// Duplicate claim reference numbers are not permitted (issue #754).
     DuplicateClaimReference = 37,
+    /// Dispute deadline must be strictly in the future (issue #740).
+    InvalidDisputeDeadline = 38,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -539,6 +545,18 @@ impl ClaimsProcessor {
         } else if now > policy.end_time {
             panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
         }
+
+        // SECURITY FIX (issue #737): Rate limit claim submissions per user to prevent claim flooding.
+        // Users must wait at least 60 seconds between successive claim submissions.
+        const USER_CLAIM_COOLDOWN_SECONDS: u64 = 60;
+        let last_claim_key = StorageKey::UserLastClaim(claimant.clone());
+        if let Some(last_time) = env.storage().persistent().get::<_, u64>(&last_claim_key) {
+            if now < last_time.saturating_add(USER_CLAIM_COOLDOWN_SECONDS) {
+                panic_with_error!(env, Error::RateLimitExceeded);
+            }
+        }
+        env.storage().persistent().set(&last_claim_key, &now);
+        env.storage().persistent().extend_ttl(&last_claim_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         let claim_id   = Self::next_claim_id(env);
 
@@ -1140,6 +1158,35 @@ impl ClaimsProcessor {
             .unwrap_or(DEFAULT_DISPUTE_WINDOW)
     }
 
+    /// Admin sets an explicit dispute deadline for a claim, validating it is strictly in the future (issue #740).
+    pub fn set_dispute_deadline(env: Env, admin: Address, claim_id: u128, deadline: u64) {
+        Self::require_admin(&env, &admin);
+        let now = env.ledger().timestamp();
+        if deadline <= now {
+            panic_with_error!(&env, Error::InvalidDisputeDeadline);
+        }
+        let _claim: Claim = env.storage().persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+        let key = StorageKey::ClaimDisputeDeadline(claim_id);
+        env.storage().persistent().set(&key, &deadline);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.events().publish(
+            (Symbol::new(&env, "dispute_deadline_set"),),
+            (claim_id, deadline),
+        );
+    }
+
+    /// Retrieve the explicit dispute deadline for a claim if configured (issue #740).
+    pub fn get_dispute_deadline(env: Env, claim_id: u128) -> Option<u64> {
+        env.storage().persistent().get(&StorageKey::ClaimDisputeDeadline(claim_id))
+    }
+
+    /// Return the timestamp of a claimant's last submitted claim (issue #737).
+    pub fn get_user_last_claim(env: Env, claimant: Address) -> u64 {
+        env.storage().persistent().get(&StorageKey::UserLastClaim(claimant)).unwrap_or(0)
+    }
+
     /// Escalate a Pending or Rejected claim to Disputed status.
     /// SECURITY FIX: Only the original claimant or the policy holder may dispute.
     /// This restricts dispute initiation to parties with legitimate interest in the claim.
@@ -1172,6 +1219,15 @@ impl ClaimsProcessor {
         {
             panic_with_error!(&env, Error::AlreadyProcessed);
         }
+
+        // Validate custom dispute deadline if set (issue #740)
+        let now = env.ledger().timestamp();
+        if let Some(deadline) = env.storage().persistent().get::<_, u64>(&StorageKey::ClaimDisputeDeadline(claim_id)) {
+            if now > deadline {
+                panic_with_error!(&env, Error::DisputeWindowExpired);
+            }
+        }
+
         if claim.status != ClaimStatus::Pending {
             if let Some(processed_at) = claim.processed_at {
                 let dispute_window = Self::get_dispute_window(env.clone());
