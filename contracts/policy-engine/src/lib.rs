@@ -93,6 +93,10 @@ enum StorageKey {
     RegisteredCategory(Symbol),
     /// Vec<Symbol> of all registered categories
     CategoryRegistry,
+    /// Maps oracle_data_type Symbol -> bool (whether registered) (issue #745)
+    RegisteredOracleDataType(Symbol),
+    /// Vec<Symbol> of all registered oracle data types (issue #745)
+    OracleDataTypeRegistry,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -288,6 +292,26 @@ impl PolicyEngine {
             .instance()
             .set(&StorageKey::CategoryRegistry, &default_categories);
 
+        let default_types: Vec<Symbol> = soroban_sdk::vec![
+            &env,
+            symbol_short!("weather"),
+            symbol_short!("flight"),
+            symbol_short!("disaster"),
+            symbol_short!("onchain"),
+            symbol_short!("defi"),
+            symbol_short!("health"),
+        ];
+        for i in 0..default_types.len() {
+            let dt = default_types.get_unchecked(i);
+            env.storage()
+                .persistent()
+                .set(&StorageKey::RegisteredOracleDataType(dt.clone()), &true);
+            Self::extend_to_max(&env, &StorageKey::RegisteredOracleDataType(dt));
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::OracleDataTypeRegistry, &default_types);
+
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
             Initialized {
@@ -461,6 +485,10 @@ impl PolicyEngine {
                     panic_with_error!(&env, Error::InvalidTriggerCombination);
                 }
             }
+        }
+
+        if !Self::is_oracle_data_type_registered(env.clone(), params.oracle_data_type.clone()) {
+            panic_with_error!(&env, Error::UnregisteredOracleDataType);
         }
 
         // SECURITY FIX: Validate oracle_data_type matches the product's trigger type.
@@ -1450,6 +1478,58 @@ impl PolicyEngine {
             .instance()
             .get(&StorageKey::CategoryRegistry)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Admin-only: register a new oracle data type (issue #745).
+    pub fn register_oracle_data_type(env: Env, admin: Address, data_type: Symbol) {
+        Self::require_admin(&env, &admin);
+
+        let key = StorageKey::RegisteredOracleDataType(data_type.clone());
+        if !env.storage().persistent().get(&key).unwrap_or(false) {
+            env.storage().persistent().set(&key, &true);
+            Self::extend_to_max(&env, &key);
+
+            let mut types: Vec<Symbol> = env
+                .storage()
+                .instance()
+                .get(&StorageKey::OracleDataTypeRegistry)
+                .unwrap_or_else(|| Vec::new(&env));
+            types.push_back(data_type);
+            env.storage().instance().set(&StorageKey::OracleDataTypeRegistry, &types);
+        }
+    }
+
+    /// Return true if `data_type` is currently registered (issue #745).
+    pub fn is_oracle_data_type_registered(env: Env, data_type: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::RegisteredOracleDataType(data_type.clone()))
+            .unwrap_or_else(|| {
+                data_type == symbol_short!("weather")
+                    || data_type == symbol_short!("flight")
+                    || data_type == symbol_short!("disaster")
+                    || data_type == symbol_short!("onchain")
+                    || data_type == symbol_short!("defi")
+                    || data_type == symbol_short!("health")
+            })
+    }
+
+    /// Return all currently registered oracle data types (issue #745).
+    pub fn get_registered_oracle_data_types(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::OracleDataTypeRegistry)
+            .unwrap_or_else(|| {
+                soroban_sdk::vec![
+                    &env,
+                    symbol_short!("weather"),
+                    symbol_short!("flight"),
+                    symbol_short!("disaster"),
+                    symbol_short!("onchain"),
+                    symbol_short!("defi"),
+                    symbol_short!("health"),
+                ]
+            })
     }
 
     // ── Admin: emergency controls ─────────────────────────────────────────────

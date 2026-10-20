@@ -224,6 +224,8 @@ pub enum Error {
     DuplicateProposal = 50,
     /// The proposed edge would point back to the delegator and close a cycle.
     CircularDelegation = 51,
+    /// A proposal template with this name already exists (issue #746).
+    DuplicateTemplateName = 52,
 }
 
 #[contract]
@@ -1864,6 +1866,10 @@ impl GovernanceDao {
         required_arg_count: u32,
     ) {
         Self::require_admin(&env, &admin);
+
+        if env.storage().instance().has(&StorageKey::Template(name.clone())) {
+            panic_with_error!(&env, Error::DuplicateTemplateName);
+        }
 
         let template = ProposalTemplate {
             name: name.clone(),

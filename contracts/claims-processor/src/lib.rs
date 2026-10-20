@@ -23,7 +23,7 @@ use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    Address, BytesN, Env, Vec, Symbol, SymbolStr, TryFromVal, IntoVal,
+    Address, Bytes, BytesN, Env, Vec, Symbol, SymbolStr, TryFromVal, IntoVal,
 };
 
 pub mod types;
@@ -145,6 +145,9 @@ enum StorageKey {
     /// Claim reference number mapping: reference_number (Symbol) -> claim_id (u128) (issue #754).
     ClaimReference(Symbol),
 }
+
+/// Maximum number of evidence files allowed per claim (issue #747).
+pub const MAX_EVIDENCE_FILES: u32 = 10;
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
