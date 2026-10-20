@@ -142,6 +142,8 @@ enum StorageKey {
     AuthorizedAttesters,
     /// Time after a claim decision during which the claimant may dispute it.
     DisputeWindow,
+    /// Claim reference number mapping: reference_number (Symbol) -> claim_id (u128) (issue #754).
+    ClaimReference(Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -210,6 +212,8 @@ pub enum Error {
     InvalidDisputeWindow = 35,
     /// The configured opportunity to dispute this decision has elapsed.
     DisputeWindowExpired = 36,
+    /// Duplicate claim reference numbers are not permitted (issue #754).
+    DuplicateClaimReference = 37,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -423,6 +427,35 @@ impl ClaimsProcessor {
         Self::require_not_zero_address(&env, &claimant);
 
         Self::file_claim(&env, &claimant, policy_id)
+    }
+
+    /// Submit a claim with an explicit reference number (issue #754).
+    /// Rejects duplicate reference numbers to prevent collisions.
+    pub fn submit_claim_with_ref(
+        env: Env,
+        claimant: Address,
+        policy_id: u128,
+        reference_number: Symbol,
+    ) -> u128 {
+        claimant.require_auth();
+        Self::require_not_paused(&env);
+        Self::require_not_admin(&env, &claimant);
+        Self::require_not_zero_address(&env, &claimant);
+
+        if reference_number == Symbol::new(&env, "") {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        let ref_key = StorageKey::ClaimReference(reference_number.clone());
+        if env.storage().persistent().has(&ref_key) {
+            panic_with_error!(&env, Error::DuplicateClaimReference);
+        }
+
+        let claim_id = Self::file_claim(&env, &claimant, policy_id);
+        env.storage().persistent().set(&ref_key, &claim_id);
+        env.storage().persistent().extend_ttl(&ref_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        claim_id
     }
 
     /// The claim-filing body shared by `submit_claim` and
