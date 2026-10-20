@@ -153,6 +153,10 @@ pub enum Error {
     NotOracleGuardian = 43,
     OracleApprovalRequired = 44,
     AdminCannotBuyPolicy = 45,
+    /// Product description / name cannot be empty (issue #755).
+    EmptyDescription = 46,
+    /// Product description / name is too short (issue #755).
+    InvalidDescription = 47,
 }
 
 // SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
@@ -426,6 +430,24 @@ impl PolicyEngine {
         let category = &params.category;
         if !Self::is_category_registered(env.clone(), category.clone()) {
             panic_with_error!(&env, Error::InvalidCategory);
+        }
+
+        // Product description / name must not be empty (issue #755).
+        if params.name == Symbol::new(&env, "") {
+            panic_with_error!(&env, Error::EmptyDescription);
+        }
+        {
+            let sym_val = params.name.to_symbol_val();
+            let sym_str: Result<SymbolStr, _> = SymbolStr::try_from_val(&env, &sym_val);
+            if let Ok(s) = sym_str {
+                let bytes: &[u8] = s.as_ref().as_bytes();
+                if bytes.is_empty() {
+                    panic_with_error!(&env, Error::EmptyDescription);
+                }
+                if bytes.len() < 3 {
+                    panic_with_error!(&env, Error::InvalidDescription);
+                }
+            }
         }
 
         match params.trigger_type {
