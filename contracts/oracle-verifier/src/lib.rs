@@ -2341,6 +2341,11 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::InvalidInput);
         }
 
+        // Zero-timestamp oracle readings are rejected (issue #735)
+        if timestamp == 0 {
+            panic_with_error!(&env, Error::InvalidTimestamp);
+        }
+
         let now = env.ledger().timestamp();
         let future_buffer: u64 = env
             .storage()
@@ -2524,6 +2529,10 @@ impl OracleVerifier {
         // Validate Symbol lengths (#502, #565).
         Self::validate_symbol_len(&env, &data_type);
         Self::validate_key_len(&env, &key);
+
+        if timestamp == 0 {
+            panic_with_error!(&env, Error::InvalidTimestamp);
+        }
 
         let now = env.ledger().timestamp();
         if timestamp > now {
@@ -3221,6 +3230,9 @@ impl OracleVerifier {
             Self::validate_key_len(&env, &sub.key);
             if sub.confidence == 0 || sub.confidence > 100 {
                 panic_with_error!(&env, Error::InvalidConfidence);
+            }
+            if sub.timestamp == 0 {
+                panic_with_error!(&env, Error::InvalidTimestamp);
             }
             let now = env.ledger().timestamp();
             let future_buffer: u64 = env
