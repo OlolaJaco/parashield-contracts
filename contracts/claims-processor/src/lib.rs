@@ -150,6 +150,8 @@ enum StorageKey {
     ClaimDisputeDeadline(u128),
     /// Per-user last claim submission timestamp: claimant (Address) -> timestamp (u64) (issue #737).
     UserLastClaim(Address),
+    /// Registered valid claim type (Symbol) -> bool (issue #734).
+    RegisteredClaimType(Symbol),
 }
 
 /// Maximum number of evidence files allowed per claim (issue #747).
@@ -225,6 +227,8 @@ pub enum Error {
     DuplicateClaimReference = 37,
     /// Dispute deadline must be strictly in the future (issue #740).
     InvalidDisputeDeadline = 38,
+    /// Claim type must be registered and non-empty (issue #734).
+    InvalidClaimType = 39,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -469,6 +473,43 @@ impl ClaimsProcessor {
         claim_id
     }
 
+    /// Register a valid claim type / product category (issue #734).
+    pub fn register_claim_type(env: Env, admin: Address, claim_type: Symbol) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if claim_type == Symbol::new(&env, "") {
+            panic_with_error!(&env, Error::InvalidClaimType);
+        }
+        let key = StorageKey::RegisteredClaimType(claim_type);
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Check if a claim type is registered (issue #734).
+    pub fn is_claim_type_registered(env: Env, claim_type: Symbol) -> bool {
+        let key = StorageKey::RegisteredClaimType(claim_type);
+        env.storage().persistent().has(&key)
+    }
+
+    /// Submit a claim with an explicit claim type (issue #734).
+    pub fn submit_claim_with_type(
+        env: Env,
+        claimant: Address,
+        policy_id: u128,
+        claim_type: Symbol,
+    ) -> u128 {
+        claimant.require_auth();
+        Self::require_not_paused(&env);
+        Self::require_not_admin(&env, &claimant);
+        Self::require_not_zero_address(&env, &claimant);
+
+        if claim_type == Symbol::new(&env, "") || !Self::is_claim_type_registered(env.clone(), claim_type) {
+            panic_with_error!(&env, Error::InvalidClaimType);
+        }
+
+        Self::file_claim(&env, &claimant, policy_id)
+    }
+
     /// The claim-filing body shared by `submit_claim` and
     /// `batch_submit_claims`. The caller has already authorized `claimant`,
     /// checked the pause flag and rejected the admin — deliberately
@@ -490,6 +531,13 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         let policy = PolicyEngineClient::new(env, &policy_engine)
             .get_policy(&policy_id);
+
+        // Validate claim type / product category is non-empty (issue #734)
+        let product = PolicyEngineClient::new(env, &policy_engine)
+            .get_product(&policy.product_id);
+        if product.category == Symbol::new(env, "") {
+            panic_with_error!(env, Error::InvalidClaimType);
+        }
 
         if policy.coverage_amount <= 0 {
             panic_with_error!(env, Error::InvalidClaimAmount);
