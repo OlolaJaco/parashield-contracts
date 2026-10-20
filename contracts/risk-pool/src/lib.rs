@@ -660,10 +660,17 @@ impl RiskPool {
         if amount == 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount > available_liquidity { panic_with_error!(&env, Error::Undercollateralized); }
 
+        // Issue #725: Update cumulative premium per share and settle yield during withdrawal
         let pending_yield = Self::settle_yield(&env, &mut position);
+        let acc_per_share: i128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::AccumulatedPerShare)
+            .unwrap_or(0);
         position.deposited = position.deposited.saturating_sub(amount);
         position.shares   -= shares;
-        position.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * position.shares) / 1_000_000_000_000;
+        position.yield_debt = (acc_per_share * position.shares) / 1_000_000_000_000;
+        env.storage().instance().set(&StorageKey::AccumulatedPerShare, &acc_per_share);
         env.storage().persistent().set(&lp_key, &position);
         Self::extend_to_max(&env, &lp_key);
         env.storage().instance().set(&StorageKey::TotalDeposited, &total_deposited.checked_sub(amount).unwrap_or_else(|| panic_with_error!(&env, Error::Overflow)));
