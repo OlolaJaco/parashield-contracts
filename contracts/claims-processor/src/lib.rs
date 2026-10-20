@@ -142,8 +142,8 @@ enum StorageKey {
     AuthorizedAttesters,
     /// Time after a claim decision during which the claimant may dispute it.
     DisputeWindow,
-    /// Submitted evidence hashes for a claim (Vec<Bytes>) (issue #747).
-    ClaimEvidence(u128),
+    /// Claim reference number mapping: reference_number (Symbol) -> claim_id (u128) (issue #754).
+    ClaimReference(Symbol),
 }
 
 /// Maximum number of evidence files allowed per claim (issue #747).
@@ -215,8 +215,8 @@ pub enum Error {
     InvalidDisputeWindow = 35,
     /// The configured opportunity to dispute this decision has elapsed.
     DisputeWindowExpired = 36,
-    /// Evidence file count exceeds maximum allowed limit (issue #747).
-    EvidenceLimitExceeded = 39,
+    /// Duplicate claim reference numbers are not permitted (issue #754).
+    DuplicateClaimReference = 37,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -430,6 +430,35 @@ impl ClaimsProcessor {
         Self::require_not_zero_address(&env, &claimant);
 
         Self::file_claim(&env, &claimant, policy_id)
+    }
+
+    /// Submit a claim with an explicit reference number (issue #754).
+    /// Rejects duplicate reference numbers to prevent collisions.
+    pub fn submit_claim_with_ref(
+        env: Env,
+        claimant: Address,
+        policy_id: u128,
+        reference_number: Symbol,
+    ) -> u128 {
+        claimant.require_auth();
+        Self::require_not_paused(&env);
+        Self::require_not_admin(&env, &claimant);
+        Self::require_not_zero_address(&env, &claimant);
+
+        if reference_number == Symbol::new(&env, "") {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        let ref_key = StorageKey::ClaimReference(reference_number.clone());
+        if env.storage().persistent().has(&ref_key) {
+            panic_with_error!(&env, Error::DuplicateClaimReference);
+        }
+
+        let claim_id = Self::file_claim(&env, &claimant, policy_id);
+        env.storage().persistent().set(&ref_key, &claim_id);
+        env.storage().persistent().extend_ttl(&ref_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        claim_id
     }
 
     /// The claim-filing body shared by `submit_claim` and
@@ -2003,27 +2032,25 @@ impl ClaimsProcessor {
             .unwrap_or(0)
     }
 
-    /// Submit evidence files for a claim, enforcing the maximum file count limit (issue #747).
-    pub fn submit_claim_evidence(env: Env, claim_id: u128, claimant: Address, evidence_hashes: Vec<Bytes>) {
+    /// Claim the payout for an approved claim, verifying that the payout token matches the policy token (issue #751).
+    pub fn claim_payout_with_token(env: Env, claim_id: u128, payout_token: Address) -> i128 {
         Self::require_not_paused(&env);
-        claimant.require_auth();
         let claim: Claim = env.storage().persistent()
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
-        if claim.claimant != claimant {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-        if evidence_hashes.len() > MAX_EVIDENCE_FILES {
-            panic_with_error!(&env, Error::EvidenceLimitExceeded);
-        }
-        let key = StorageKey::ClaimEvidence(claim_id);
-        env.storage().persistent().set(&key, &evidence_hashes);
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
-    }
 
-    /// Retrieve attached evidence hashes for a claim if available (issue #747).
-    pub fn get_claim_evidence(env: Env, claim_id: u128) -> Vec<Bytes> {
-        env.storage().persistent().get(&StorageKey::ClaimEvidence(claim_id)).unwrap_or_else(|| Vec::new(&env))
+        let policy_engine: Address = env.storage().instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        let policy = PolicyEngineClient::new(&env, &policy_engine).get_policy(&claim.policy_id);
+        let product = PolicyEngineClient::new(&env, &policy_engine).get_product(&policy.product_id);
+
+        if payout_token != product.expected_token {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
+
+        Self::claim_payout(env, claim_id)
     }
 
     /// Claim the payout for an approved claim after the payout delay has elapsed.
