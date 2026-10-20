@@ -70,7 +70,7 @@ const DEFAULT_MAX_UTILIZATION_BPS: u32 = 10_000;
 ///
 /// An unbounded delay is indistinguishable from freezing LP funds, so the
 /// ceiling is part of what makes the queue safe to hand to an admin at all.
-const MAX_EXIT_DELAY: u64 = 30 * 24 * 60 * 60;
+pub const MAX_EXIT_DELAY: u64 = 30 * 24 * 60 * 60;
 
 /// Most LP slots inspected by one auto-processing pass (issue #511).
 ///
@@ -1093,6 +1093,7 @@ impl RiskPool {
     ///
     /// Capped at `MAX_EXIT_DELAY` (30 days). An unbounded delay would be
     /// indistinguishable from freezing LP funds.
+    /// Rejects delays exceeding `MAX_EXIT_DELAY` with `ExitDelayTooLong` (issue #743).
     pub fn set_exit_delay(env: Env, admin: Address, delay_seconds: u64) {
         Self::require_admin(&env, &admin);
 

@@ -1487,6 +1487,9 @@ impl ClaimsProcessor {
         if threshold > guardians.len() {
             panic_with_error!(&env, Error::InvalidThreshold);
         }
+        if guardians.is_empty() && threshold > 0 {
+            panic_with_error!(&env, Error::InvalidThreshold);
+        }
         env.storage().instance().set(&StorageKey::Guardians, &guardians);
         env.storage()
             .instance()
@@ -1494,6 +1497,27 @@ impl ClaimsProcessor {
         env.events().publish(
             (Symbol::new(&env, "guardians_updated"),),
             GuardiansUpdated { guardians, threshold },
+        );
+    }
+
+    /// Update guardian threshold independently, validating threshold <= registered guardian count (issue #744).
+    pub fn set_guardian_threshold(env: Env, admin: Address, threshold: u32) {
+        let stored_admin: Address = env.storage().instance().get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if admin != stored_admin { panic_with_error!(&env, Error::Unauthorized); }
+        admin.require_auth();
+        let guardians: Vec<Address> = env.storage().instance().get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        if threshold > guardians.len() {
+            panic_with_error!(&env, Error::InvalidThreshold);
+        }
+        if !guardians.is_empty() && threshold == 0 {
+            panic_with_error!(&env, Error::InvalidThreshold);
+        }
+        env.storage().instance().set(&StorageKey::GuardianThreshold, &threshold);
+        env.events().publish(
+            (Symbol::new(&env, "guardian_threshold_updated"),),
+            threshold,
         );
     }
 
