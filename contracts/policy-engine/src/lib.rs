@@ -967,7 +967,10 @@ impl PolicyEngine {
         let max_duration_secs = (product.max_duration_days as u64)
             .checked_mul(86_400)
             .unwrap_or(u64::MAX);
-        if end_time.saturating_sub(start_time) > max_duration_secs {
+        if end_time.saturating_sub(start_time) > max_duration_secs
+            || end_time > start_time.saturating_add(max_duration_secs)
+            || duration_days > product.max_duration_days
+        {
             panic_with_error!(env, Error::DurationTooLong);
         }
         let policy_id = Self::next_policy_id(env);
