@@ -106,8 +106,10 @@ enum StorageKey {
     /// Guardian addresses authorized to approve critical actions (Vec<Address>).
     Guardians,
     /// Number of guardian approvals required to execute a critical action
-    /// (u32). 0 means guardian multisig is disabled (admin acts alone).
+    /// (u32). Zero is only valid before guardians are configured.
     GuardianThreshold,
+    /// Guardian set and threshold proposed by the admin, awaiting approval.
+    PendingGuardianConfig,
     /// A pending, not-yet-executed contract upgrade awaiting guardian approvals.
     PendingUpgrade,
     /// Seconds a claim may sit Pending before it can be escalated (u64).
@@ -210,6 +212,8 @@ pub enum Error {
     InvalidDisputeWindow = 35,
     /// The configured opportunity to dispute this decision has elapsed.
     DisputeWindowExpired = 36,
+    /// No guardian configuration is awaiting approval.
+    NoPendingGuardianConfig = 37,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -1469,24 +1473,50 @@ impl ClaimsProcessor {
     }
 
     /// Configure the guardian set and approval threshold required for
-    /// critical actions (currently: contract upgrades). Admin-only.
-    /// `threshold == 0` disables the guardian requirement (default), so the
-    /// admin alone can act — preserves existing single-admin behavior until
-    /// guardians are explicitly configured.
+    /// critical actions (currently: contract upgrades). The first set is
+    /// bootstrapped by the admin; later changes require approval from the
+    /// current guardians through `approve_guardian_config`.
     pub fn set_guardians(env: Env, admin: Address, guardians: Vec<Address>, threshold: u32) {
         let stored_admin: Address = env.storage().instance().get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         if admin != stored_admin { panic_with_error!(&env, Error::Unauthorized); }
         admin.require_auth();
-        // A non-empty guardian set with threshold=0 would bypass multisig
-        // entirely while appearing configured (#608). Require at least one
-        // approval whenever guardians are active.
+
         if !guardians.is_empty() && threshold == 0 {
             panic_with_error!(&env, Error::InvalidThreshold);
         }
         if threshold > guardians.len() {
             panic_with_error!(&env, Error::InvalidThreshold);
         }
+
+        for i in 0..guardians.len() {
+            for j in (i + 1)..guardians.len() {
+                if guardians.get_unchecked(i) == guardians.get_unchecked(j) {
+                    panic_with_error!(&env, Error::InvalidThreshold);
+                }
+            }
+        }
+
+        let current_guardians: Vec<Address> = env.storage().instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !current_guardians.is_empty() {
+            if guardians.is_empty() {
+                panic_with_error!(&env, Error::InvalidThreshold);
+            }
+            let pending = PendingGuardianConfig {
+                guardians: guardians.clone(),
+                threshold,
+                approvals: Vec::new(&env),
+            };
+            env.storage().instance().set(&StorageKey::PendingGuardianConfig, &pending);
+            env.events().publish(
+                (Symbol::new(&env, "guardian_config_proposed"),),
+                GuardianConfigProposed { guardians, threshold },
+            );
+            return;
+        }
+
         env.storage().instance().set(&StorageKey::Guardians, &guardians);
         env.storage()
             .instance()
@@ -1497,6 +1527,69 @@ impl ClaimsProcessor {
         );
     }
 
+    /// Approve the admin's proposed guardian set. Once the current
+    /// threshold approves, the new set and threshold take effect atomically.
+    pub fn approve_guardian_config(env: Env, guardian: Address) {
+        guardian.require_auth();
+        let guardians: Vec<Address> = env.storage().instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_guardian = false;
+        for configured in guardians.iter() {
+            if configured == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        let mut pending: PendingGuardianConfig = env.storage().instance()
+            .get(&StorageKey::PendingGuardianConfig)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingGuardianConfig));
+        for approved in pending.approvals.iter() {
+            if approved == guardian {
+                panic_with_error!(&env, Error::AlreadyApprovedAction);
+            }
+        }
+        pending.approvals.push_back(guardian.clone());
+
+        let required = env.storage().instance()
+            .get::<_, u32>(&StorageKey::GuardianThreshold)
+            .unwrap_or(0)
+            .max(1);
+        let approvals = pending.approvals.len();
+        env.events().publish(
+            (Symbol::new(&env, "guardian_config_approved"),),
+            GuardianConfigApproved {
+                approver: guardian,
+                approvals,
+                required,
+            },
+        );
+
+        if approvals >= required {
+            env.storage().instance().set(&StorageKey::Guardians, &pending.guardians);
+            env.storage().instance().set(&StorageKey::GuardianThreshold, &pending.threshold);
+            env.storage().instance().remove(&StorageKey::PendingGuardianConfig);
+            env.events().publish(
+                (Symbol::new(&env, "guardians_updated"),),
+                GuardiansUpdated {
+                    guardians: pending.guardians,
+                    threshold: pending.threshold,
+                },
+            );
+        } else {
+            env.storage().instance().set(&StorageKey::PendingGuardianConfig, &pending);
+        }
+    }
+
+    /// Return the pending guardian configuration, if one is awaiting approval.
+    pub fn get_pending_guardian_config(env: Env) -> Option<PendingGuardianConfig> {
+        env.storage().instance().get(&StorageKey::PendingGuardianConfig)
+    }
+
     /// Return the current guardian set.
     pub fn get_guardians(env: Env) -> Vec<Address> {
         env.storage()
@@ -1505,7 +1598,7 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Return the current guardian approval threshold (0 = disabled).
+    /// Return the current guardian approval threshold (0 before bootstrap).
     pub fn get_guardian_threshold(env: Env) -> u32 {
         env.storage()
             .instance()

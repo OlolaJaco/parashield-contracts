@@ -211,6 +211,7 @@ pub struct PolicyClaimed {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyExpired {
     pub policy_id: u128,
+    pub timestamp: u64,
 }
 
 #[contracttype]

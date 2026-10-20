@@ -1406,6 +1406,33 @@ fn test_submit_data_rejects_empty_key() {
 }
 
 #[test]
+fn plaintext_readings_are_pruned_to_the_retention_limit() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let key = kisumu_key();
+    let timestamp = env.ledger().timestamp();
+
+    for index in 0..=MAX_DATA_POINTS {
+        let oracle = Address::generate(&env);
+        client.add_oracle(&admin, &oracle, &weather(), &90u32);
+        client.submit_data(
+            &oracle,
+            &weather(),
+            &key,
+            &(10_000_000i128 + index as i128),
+            &95u32,
+            &timestamp,
+        );
+    }
+
+    assert_eq!(
+        client.get_data_points(&weather(), &key).len(),
+        MAX_DATA_POINTS,
+        "storage must retain no more than the configured per-key limit",
+    );
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #31)")]
 fn test_batch_submit_data_rejects_empty_key() {
     let (env, admin, contract_id) = setup();
