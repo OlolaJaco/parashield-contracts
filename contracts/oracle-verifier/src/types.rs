@@ -678,3 +678,13 @@ pub struct StakeWithdrawalCancelled {
 pub struct ChallengePeriodUpdated {
     pub period_seconds: u64,
 }
+
+/// Query item for batch oracle verification (#683).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleReadingQuery {
+    pub data_type: Symbol,
+    pub key: Symbol,
+    pub condition: TriggerCondition,
+    pub staleness_threshold: u64,
+}

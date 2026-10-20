@@ -489,3 +489,12 @@ pub struct FraudFlagged {
     pub flags: u32,
     pub mode: FraudMode,
 }
+
+/// Emitted when multiple oracle readings are verified in a batch for a claim (#683).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadingsBatchVerified {
+    pub claim_id: u128,
+    pub readings_count: u32,
+    pub trigger_met: bool,
+}

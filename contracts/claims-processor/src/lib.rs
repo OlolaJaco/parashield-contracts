@@ -54,6 +54,11 @@ trait IOracleVerifier {
         condition: parashield_oracle_verifier::TriggerCondition,
         max_age_seconds: u64,
     ) -> bool;
+
+    fn batch_verify_fresh(
+        env: Env,
+        queries: soroban_sdk::Vec<parashield_oracle_verifier::OracleReadingQuery>,
+    ) -> soroban_sdk::Vec<bool>;
 }
 
 // ─── Storage TTL ──────────────────────────────────────────────────────────────
@@ -676,6 +681,119 @@ impl ClaimsProcessor {
         );
 
         results
+    }
+
+    /// Batch-verify multiple oracle readings for a claim or policy in a single cross-contract call (#683).
+    /// Drastically reduces CPU and instruction cost compared to individual verifications.
+    pub fn batch_verify_oracle_readings(
+        env: Env,
+        queries: Vec<parashield_oracle_verifier::OracleReadingQuery>,
+    ) -> Vec<bool> {
+        let oracle_verifier: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::OracleVerifier)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        OracleVerifierClient::new(&env, &oracle_verifier).batch_verify_fresh(&queries)
+    }
+
+    /// Legacy individual verification of multiple oracle readings, executing N separate
+    /// cross-contract calls into oracle-verifier. Kept for comparison/benchmarking (#683).
+    pub fn verify_readings_individual(
+        env: Env,
+        queries: Vec<parashield_oracle_verifier::OracleReadingQuery>,
+    ) -> Vec<bool> {
+        let oracle_verifier: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::OracleVerifier)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        let client = OracleVerifierClient::new(&env, &oracle_verifier);
+        let mut results = Vec::new(&env);
+        for i in 0..queries.len() {
+            let q = queries.get_unchecked(i);
+            let res = client.verify_trigger_fresh(
+                &q.data_type,
+                &q.key,
+                &q.condition,
+                &q.staleness_threshold,
+            );
+            results.push_back(res);
+        }
+        results
+    }
+
+    /// Process a multi-reading claim by batch-verifying all required oracle readings
+    /// in a single cross-contract invocation (#683).
+    ///
+    /// `require_all`: if true, requires all queries to evaluate to true (AND logic);
+    /// if false, requires at least one query to evaluate to true (OR logic).
+    pub fn process_multi_reading_claim(
+        env: Env,
+        keeper: Address,
+        claim_id: u128,
+        queries: Vec<parashield_oracle_verifier::OracleReadingQuery>,
+        require_all: bool,
+        partial_payout_bps: Option<u32>,
+    ) -> ClaimResult {
+        Self::require_keeper(&env, &keeper);
+        Self::require_not_paused(&env);
+        if queries.is_empty() {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        let mut claim: Claim = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        if claim.status != ClaimStatus::Pending {
+            return ClaimResult::AlreadyProcessed;
+        }
+
+        let policy_engine: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        let policy = PolicyEngineClient::new(&env, &policy_engine).get_policy(&claim.policy_id);
+
+        if claim.coverage_amount != policy.coverage_amount {
+            panic_with_error!(&env, Error::CoverageMismatch);
+        }
+
+        // Batch verify all readings in ONE cross-contract call
+        let results = Self::batch_verify_oracle_readings(env.clone(), queries.clone());
+
+        let mut trigger_met = if require_all { true } else { false };
+        for i in 0..results.len() {
+            let r = results.get_unchecked(i);
+            if require_all {
+                if !r {
+                    trigger_met = false;
+                    break;
+                }
+            } else {
+                if r {
+                    trigger_met = true;
+                    break;
+                }
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "readings_batch_verified"),),
+            ReadingsBatchVerified {
+                claim_id,
+                readings_count: queries.len(),
+                trigger_met,
+            },
+        );
+
+        Self::settle_claim_with_trigger_result(&env, &mut claim, &policy, trigger_met, partial_payout_bps)
     }
 
 
@@ -2212,26 +2330,16 @@ impl ClaimsProcessor {
         policy: &parashield_policy_engine::Policy,
         partial_payout_bps: Option<u32>,
     ) -> ClaimResult {
-        // Validate claim is in Pending state before transitioning (atomic state guard)  
         if claim.status != ClaimStatus::Pending {
             panic_with_error!(env, Error::AlreadyProcessed);
         }
-        // Payout goes to the policy's holder, so the claim must still belong to
-        // them. `submit_claim` checks this at filing time; re-checking here
-        // closes the window where the policy changes hands (or a claim record
-        // otherwise disagrees with the policy) before settlement (issue #512).
         if claim.claimant != policy.policyholder {
             panic_with_error!(env, Error::Unauthorized);
         }
         let oracle_verifier: Address = env.storage().instance()
             .get(&StorageKey::OracleVerifier)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        let policy_engine: Address = env.storage().instance()
-            .get(&StorageKey::PolicyEngine)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
-        let risk_pool: Address = env.storage().instance()
-            .get(&StorageKey::RiskPool)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+
         // Configurable staleness threshold (default 7 days = 604_800 s if not set)
         let staleness_threshold: u64 = env.storage().instance()
             .get(&StorageKey::StalenessThreshold)
@@ -2255,6 +2363,30 @@ impl ClaimsProcessor {
                 &staleness_threshold,
             );
 
+        Self::settle_claim_with_trigger_result(env, claim, policy, trigger_met, partial_payout_bps)
+    }
+
+    /// Internal settlement logic shared by single-reading and multi-reading claim flows (#683).
+    fn settle_claim_with_trigger_result(
+        env: &Env,
+        claim: &mut Claim,
+        policy: &parashield_policy_engine::Policy,
+        trigger_met: bool,
+        partial_payout_bps: Option<u32>,
+    ) -> ClaimResult {
+        if claim.status != ClaimStatus::Pending {
+            panic_with_error!(env, Error::AlreadyProcessed);
+        }
+        if claim.claimant != policy.policyholder {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        let policy_engine: Address = env.storage().instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let risk_pool: Address = env.storage().instance()
+            .get(&StorageKey::RiskPool)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+
         claim.trigger_met  = trigger_met;
         claim.processed_at = Some(env.ledger().timestamp());
 
@@ -2262,8 +2394,6 @@ impl ClaimsProcessor {
 
         let result = if trigger_met {
             // Determine payout: full or partial based on partial_payout_bps.
-            // Parametric model design: pays the pre-agreed coverage amount (or pre-set partial bps)
-            // automatically when the oracle condition is verified, without assessing post-hoc actual loss.
             let bps = partial_payout_bps.unwrap_or(10_000);
             let effective_bps = if bps > 10_000 { 10_000 } else { bps };
             let now = env.ledger().timestamp();
@@ -2275,10 +2405,8 @@ impl ClaimsProcessor {
                 claim.partial_payout_bps = Some(10_000);
 
                 if payout_delay > 0 {
-                    // Delay payout: record when payout becomes available
                     claim.payout_ready_at = Some(now.saturating_add(payout_delay));
                 } else {
-                    // Immediate payout
                     PolicyEngineClient::new(env, &policy_engine)
                         .pay_claim(&env.current_contract_address(), &claim.policy_id);
                     RiskPoolClient::new(env, &risk_pool)
@@ -2286,9 +2414,8 @@ impl ClaimsProcessor {
                 }
                 ClaimResult::Paid
             } else {
-                // Partial payment: calculate proportional payout
+                // Partial payment
                 let paid = claim.coverage_amount * (effective_bps as i128) / 10_000;
-                // A payout can never exceed the policy's coverage (issue #550).
                 if paid > claim.coverage_amount {
                     panic_with_error!(env, Error::PayoutExceedsCoverage);
                 }
@@ -2314,12 +2441,8 @@ impl ClaimsProcessor {
         env.storage().persistent().set(&StorageKey::Claim(claim.id), claim);
         env.storage().persistent().extend_ttl(&StorageKey::Claim(claim.id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
-        // The claim is now settled (Paid/Rejected) — drop it from the pending
-        // queue so it is neither re-evaluated nor allowed to grow the queue
-        // without bound.
         Self::remove_from_pending(env, claim.id);
 
-        // Emit specific event for rejected/paid claims to enable off-chain monitoring
         if trigger_met {
             env.events().publish(
                 (Symbol::new(env, "claim_paid"),),

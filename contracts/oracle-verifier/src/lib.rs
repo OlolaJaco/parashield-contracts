@@ -3017,6 +3017,27 @@ impl OracleVerifier {
         result
     }
 
+    /// Batch-verify multiple oracle readings in a single invocation (#683).
+    /// Eliminates per-reading cross-contract call overhead for complex claims.
+    pub fn batch_verify_fresh(
+        env: Env,
+        queries: Vec<OracleReadingQuery>,
+    ) -> Vec<bool> {
+        let mut results = Vec::new(&env);
+        for i in 0..queries.len() {
+            let q = queries.get_unchecked(i);
+            let res = Self::verify_trigger_fresh(
+                env.clone(),
+                q.data_type,
+                q.key,
+                q.condition,
+                q.staleness_threshold,
+            );
+            results.push_back(res);
+        }
+        results
+    }
+
     /// Submit data for multiple keys in one call.
     /// Each tuple: (key, value, confidence, timestamp). Every key must satisfy
     /// the same length rules as `submit_data` (#565).
