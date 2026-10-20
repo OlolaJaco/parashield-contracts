@@ -214,6 +214,30 @@ pub struct GuardiansUpdated {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardianConfigProposed {
+    pub guardians: Vec<Address>,
+    pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardianConfigApproved {
+    pub approver: Address,
+    pub approvals: u32,
+    pub required: u32,
+}
+
+/// A proposed guardian set awaiting approval from the current guardian set.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingGuardianConfig {
+    pub guardians: Vec<Address>,
+    pub threshold: u32,
+    pub approvals: Vec<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpgradeApproved {
     pub new_wasm_hash: BytesN<32>,
     pub approver: Address,

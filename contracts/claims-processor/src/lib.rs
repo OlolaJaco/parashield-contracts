@@ -106,8 +106,10 @@ enum StorageKey {
     /// Guardian addresses authorized to approve critical actions (Vec<Address>).
     Guardians,
     /// Number of guardian approvals required to execute a critical action
-    /// (u32). 0 means guardian multisig is disabled (admin acts alone).
+    /// (u32). Zero is only valid before guardians are configured.
     GuardianThreshold,
+    /// Guardian set and threshold proposed by the admin, awaiting approval.
+    PendingGuardianConfig,
     /// A pending, not-yet-executed contract upgrade awaiting guardian approvals.
     PendingUpgrade,
     /// Seconds a claim may sit Pending before it can be escalated (u64).
@@ -148,8 +150,8 @@ enum StorageKey {
     ClaimDisputeDeadline(u128),
     /// Per-user last claim submission timestamp: claimant (Address) -> timestamp (u64) (issue #737).
     UserLastClaim(Address),
-    /// Submitted evidence hashes for a claim (Vec<Bytes>) (issue #728, #747).
-    ClaimEvidence(u128),
+    /// Registered valid claim type (Symbol) -> bool (issue #734).
+    RegisteredClaimType(Symbol),
 }
 
 /// Maximum number of evidence files allowed per claim (issue #747).
@@ -225,10 +227,8 @@ pub enum Error {
     DuplicateClaimReference = 37,
     /// Dispute deadline must be strictly in the future (issue #740).
     InvalidDisputeDeadline = 38,
-    /// Evidence file count exceeds maximum allowed limit (issue #747).
-    EvidenceLimitExceeded = 39,
-    /// Evidence hash cannot be zero or invalid format (issue #728).
-    InvalidEvidence = 40,
+    /// Claim type must be registered and non-empty (issue #734).
+    InvalidClaimType = 39,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -473,6 +473,43 @@ impl ClaimsProcessor {
         claim_id
     }
 
+    /// Register a valid claim type / product category (issue #734).
+    pub fn register_claim_type(env: Env, admin: Address, claim_type: Symbol) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if claim_type == Symbol::new(&env, "") {
+            panic_with_error!(&env, Error::InvalidClaimType);
+        }
+        let key = StorageKey::RegisteredClaimType(claim_type);
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Check if a claim type is registered (issue #734).
+    pub fn is_claim_type_registered(env: Env, claim_type: Symbol) -> bool {
+        let key = StorageKey::RegisteredClaimType(claim_type);
+        env.storage().persistent().has(&key)
+    }
+
+    /// Submit a claim with an explicit claim type (issue #734).
+    pub fn submit_claim_with_type(
+        env: Env,
+        claimant: Address,
+        policy_id: u128,
+        claim_type: Symbol,
+    ) -> u128 {
+        claimant.require_auth();
+        Self::require_not_paused(&env);
+        Self::require_not_admin(&env, &claimant);
+        Self::require_not_zero_address(&env, &claimant);
+
+        if claim_type == Symbol::new(&env, "") || !Self::is_claim_type_registered(env.clone(), claim_type) {
+            panic_with_error!(&env, Error::InvalidClaimType);
+        }
+
+        Self::file_claim(&env, &claimant, policy_id)
+    }
+
     /// The claim-filing body shared by `submit_claim` and
     /// `batch_submit_claims`. The caller has already authorized `claimant`,
     /// checked the pause flag and rejected the admin — deliberately
@@ -495,12 +532,23 @@ impl ClaimsProcessor {
         let policy = PolicyEngineClient::new(env, &policy_engine)
             .get_policy(&policy_id);
 
+        // Validate claim type / product category is non-empty (issue #734)
+        let product = PolicyEngineClient::new(env, &policy_engine)
+            .get_product(&policy.product_id);
+        if product.category == Symbol::new(env, "") {
+            panic_with_error!(env, Error::InvalidClaimType);
+        }
+
         if policy.coverage_amount <= 0 {
             panic_with_error!(env, Error::InvalidClaimAmount);
         }
 
         if policy.policyholder != *claimant {
             panic_with_error!(env, Error::Unauthorized);
+        }
+        // Guard: reject claims for cancelled policies (issue #731).
+        if policy.status == parashield_policy_engine::PolicyStatus::Cancelled {
+            panic_with_error!(env, Error::PolicyNotActive);
         }
         if policy.status != parashield_policy_engine::PolicyStatus::Active {
             panic_with_error!(env, Error::PolicyNotActive);
@@ -1567,18 +1615,15 @@ impl ClaimsProcessor {
     }
 
     /// Configure the guardian set and approval threshold required for
-    /// critical actions (currently: contract upgrades). Admin-only.
-    /// `threshold == 0` disables the guardian requirement (default), so the
-    /// admin alone can act — preserves existing single-admin behavior until
-    /// guardians are explicitly configured.
+    /// critical actions (currently: contract upgrades). The first set is
+    /// bootstrapped by the admin; later changes require approval from the
+    /// current guardians through `approve_guardian_config`.
     pub fn set_guardians(env: Env, admin: Address, guardians: Vec<Address>, threshold: u32) {
         let stored_admin: Address = env.storage().instance().get(&StorageKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         if admin != stored_admin { panic_with_error!(&env, Error::Unauthorized); }
         admin.require_auth();
-        // A non-empty guardian set with threshold=0 would bypass multisig
-        // entirely while appearing configured (#608). Require at least one
-        // approval whenever guardians are active.
+
         if !guardians.is_empty() && threshold == 0 {
             panic_with_error!(&env, Error::InvalidThreshold);
         }
@@ -1627,7 +1672,7 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Return the current guardian approval threshold (0 = disabled).
+    /// Return the current guardian approval threshold (0 before bootstrap).
     pub fn get_guardian_threshold(env: Env) -> u32 {
         env.storage()
             .instance()

@@ -1102,6 +1102,9 @@ fn sequential_create_product_ids_are_unique_and_monotone() {
 
 #[test]
 fn test_policy_expires_at_exact_boundary() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::TryFromVal;
+
     let (env, admin, _oracle, usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);
     let pid = create_crop_product(&env, &client, &admin);
@@ -1116,12 +1119,23 @@ fn test_policy_expires_at_exact_boundary() {
     let claims_processor = Address::generate(&env);
     client.set_claims_processor(&admin, &claims_processor);
     
-    // Set timestamp to exactly expiration boundary
-    env.ledger().with_mut(|l| l.timestamp = now + duration as u64 * 86_400);
-    
+    let expired_at = now + duration as u64 * 86_400;
+    env.ledger().with_mut(|l| l.timestamp = expired_at);
+
     client.expire_policy(&claims_processor, &policy_id);
     let policy = client.get_policy(&policy_id);
     assert_eq!(policy.status, PolicyStatus::Expired);
+
+    let topic = Symbol::new(&env, "policy_expired");
+    let event_found = env.events().all().iter().any(|event| {
+        event.0 == contract_id
+            && event.1.iter().any(|value| Symbol::try_from_val(&env, &value) == Ok(topic.clone()))
+            && match PolicyExpired::try_from_val(&env, &event.2) {
+                Ok(data) => data == (PolicyExpired { policy_id, timestamp: expired_at }),
+                Err(_) => false,
+            }
+    });
+    assert!(event_found, "expiration event must include policy ID and timestamp");
 }
 
 // ── Versioning tests ─────────────────────────────────────────────────────────

@@ -218,6 +218,8 @@ impl PolicyEngine {
         if oracle_buf[0] != b'C' {
             panic_with_error!(&env, Error::InvalidAddress);
         }
+        // Reject zero address as oracle (issue #730)
+        Self::require_not_zero_address(&env, &oracle_address);
 
         let balance_res = env.try_invoke_contract::<i128, soroban_sdk::Error>(
             &usdc_token,
@@ -367,6 +369,8 @@ impl PolicyEngine {
         if oracle_buf[0] != b'C' {
             panic_with_error!(&env, Error::InvalidAddress);
         }
+        // Reject zero address as oracle (issue #730)
+        Self::require_not_zero_address(&env, &new_oracle);
 
         let change = PendingOracleChange {
             new_oracle: new_oracle.clone(),
@@ -540,12 +544,9 @@ impl PolicyEngine {
         {
             panic_with_error!(&env, Error::InvalidTriggerThreshold);
         }
-        // Coverage bounds must form a valid, positive range: 0 < min < max.
-        // Rejects free coverage (min <= 0) and inverted or zero-width ranges
-        // (min >= max), which `buy_policy` could never satisfy (issue #567).
-        // A non-positive `max` cannot satisfy the same inequality, so it
-        // needs no separate branch.
-        if params.coverage_min <= 0 || params.coverage_min >= params.coverage_max {
+        // Coverage bounds must form a valid, positive range: 0 < min < max (issue #736, #567).
+        // Rejects free coverage (min <= 0) and inverted or zero-width ranges (coverage_max < coverage_min).
+        if params.coverage_min <= 0 || params.coverage_max < params.coverage_min || params.coverage_min >= params.coverage_max {
             panic_with_error!(&env, Error::InvalidCoverageRange);
         }
         // Coverage ceiling must be reasonable (issue #616). An unbounded
@@ -1261,9 +1262,10 @@ impl PolicyEngine {
             .set(&StorageKey::Policy(policy_id), &policy);
         Self::remove_policy_from_user(&env, &policy.policyholder, policy_id);
 
+        let timestamp = env.ledger().timestamp();
         env.events().publish(
             (Symbol::new(&env, "policy_expired"),),
-            PolicyExpired { policy_id },
+            PolicyExpired { policy_id, timestamp },
         );
     }
 
@@ -2004,6 +2006,17 @@ impl PolicyEngine {
     }
 
     fn migrate_v2_to_v3(_env: &Env) {}
+
+    /// Require that an address is not the zero address (issue #730).
+    fn require_not_zero_address(env: &Env, address: &Address) {
+        let zero = Address::from_string(&soroban_sdk::String::from_str(
+            env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        if *address == zero {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
+    }
 }
 
 #[cfg(test)]

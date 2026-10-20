@@ -167,6 +167,8 @@ pub(crate) enum StorageKey {
     ReentrancyGuard,
     /// Human-readable pool name (issue #748).
     PoolName,
+    /// Approvals count for pending admin withdrawal (issue #733).
+    AdminWithdrawalApprovals,
 }
 
 /// Maximum pool name length in bytes/characters (issue #748).
@@ -281,8 +283,8 @@ impl RiskPool {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
-        // An empty category would make the pool's accounting and LP NFT
-        // metadata ambiguous, so reject it up front (issue #520).
+        // Category name cannot be empty and must describe a valid risk category (issue #729, #520).
+        // Empty category names are rejected to prevent unnamed categories in the pool registry.
         if category == Symbol::new(&env, "") {
             panic_with_error!(&env, Error::InvalidCategory);
         }
@@ -2252,6 +2254,21 @@ impl RiskPool {
             panic_with_error!(&env, Error::TimelockPending);
         }
 
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+        if !guardians.is_empty() && threshold == 0 {
+            panic_with_error!(&env, Error::InvalidThreshold);
+        }
+        env.storage().persistent().set(&StorageKey::AdminWithdrawalApprovals, &0u32);
+
         let now = env.ledger().timestamp();
         // Freeze the deadline now. Recomputing it at execution time would let a
         // contract upgrade that shortens TIMELOCK_SECONDS cut the wait on a
@@ -2278,6 +2295,34 @@ impl RiskPool {
         );
     }
 
+    /// Guardian approval for an admin withdrawal request (issue #733).
+    pub fn approve_admin_withdrawal(env: Env, guardian: Address) {
+        guardian.require_auth();
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_guardian = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+        let approvals: u32 = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::AdminWithdrawalApprovals)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::AdminWithdrawalApprovals, &(approvals + 1));
+    }
+
     /// Execute a previously requested admin withdrawal after the 7-day timelock.
     /// Funds are transferred to the treasury address.
     pub fn execute_admin_withdrawal(env: Env, admin: Address) {
@@ -2288,6 +2333,22 @@ impl RiskPool {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingWithdrawal));
 
         if req.executed { panic_with_error!(&env, Error::AlreadyReleased); }
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+        if threshold > 0 {
+            let approvals: u32 = env
+                .storage()
+                .persistent()
+                .get(&StorageKey::AdminWithdrawalApprovals)
+                .unwrap_or(0);
+            if approvals < threshold {
+                panic_with_error!(&env, Error::Unauthorized);
+            }
+        }
 
         let now = env.ledger().timestamp();
         if now < req.execute_after {

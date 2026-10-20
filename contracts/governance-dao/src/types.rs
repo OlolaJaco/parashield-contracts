@@ -84,9 +84,9 @@ pub struct Proposal {
     pub function: Symbol,
     pub args: Vec<Val>,
     /// gov_token amount actually locked from the proposer at creation.
-    /// Refunded verbatim at finalize() — never re-read from the live
-    /// DaoConfig, since config.proposal_threshold can change between
-    /// proposal creation and finalization.
+    /// Never re-read from the live DaoConfig: failed/cancelled proposals
+    /// refund this amount in full, while passed proposals refund a portion
+    /// after execution based on the target's returned completion bps.
     pub deposit: i128,
     pub status: ProposalStatus,
     pub votes_for: i128,
@@ -293,6 +293,17 @@ pub struct ProposalExecuted {
     pub target: Address,
     pub function: Symbol,
     pub executed_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalDepositRefunded {
+    pub proposal_id: u64,
+    pub proposer: Address,
+    pub deposit: i128,
+    pub execution_bps: u32,
+    pub refund_amount: i128,
+    pub retained_amount: i128,
 }
 
 
