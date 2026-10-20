@@ -19,7 +19,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    token, Address, Env, IntoVal, Symbol, Val, Vec,
+    token, Address, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 pub mod types;
@@ -70,7 +70,7 @@ const DEFAULT_MAX_UTILIZATION_BPS: u32 = 10_000;
 ///
 /// An unbounded delay is indistinguishable from freezing LP funds, so the
 /// ceiling is part of what makes the queue safe to hand to an admin at all.
-const MAX_EXIT_DELAY: u64 = 30 * 24 * 60 * 60;
+pub const MAX_EXIT_DELAY: u64 = 30 * 24 * 60 * 60;
 
 /// Most LP slots inspected by one auto-processing pass (issue #511).
 ///
@@ -165,7 +165,12 @@ pub(crate) enum StorageKey {
     FeeTierList,
     /// Reentrancy guard flag to prevent reentrant external calls.
     ReentrancyGuard,
+    /// Human-readable pool name (issue #748).
+    PoolName,
 }
+
+/// Maximum pool name length in bytes/characters (issue #748).
+pub const MAX_POOL_NAME_LEN: u32 = 32;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -230,6 +235,8 @@ pub enum Error {
     PoolDrained               = 46,
     /// Reentrant call detected and blocked by reentrancy guard.
     Reentrancy                = 47,
+    /// Pool name exceeds maximum allowable length or is empty (issue #748).
+    NameTooLong               = 48,
 }
 
 /// RAII Reentrancy Guard that sets transient/instance lock on entry and cleans up on drop.
@@ -282,6 +289,7 @@ impl RiskPool {
         // Address validation is deferred to require_auth() calls which
         // verify the address on the Soroban network layer.
         
+        Self::require_not_zero_address(&env, &admin);
         let admin_str = admin.to_string();
 
         if admin_str.len() != 56 {
@@ -371,6 +379,24 @@ impl RiskPool {
     /// capacity change lands on their own deposit. The separation costs
     /// nothing here — the pool already requires third-party liquidity to
     /// function — so the conflict is refused outright rather than bounded.
+    /// Deposit liquidity specifying the deposit token address, verifying it matches the pool's token (issue #738).
+    pub fn deposit_with_token(
+        env: Env,
+        provider: Address,
+        deposit_token: Address,
+        amount: i128,
+        min_shares: i128,
+        compound_enabled: bool,
+    ) -> i128 {
+        let usdc: Address = env.storage().instance()
+            .get(&StorageKey::UsdcToken)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if deposit_token != usdc {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
+        Self::deposit(env, provider, amount, min_shares, compound_enabled)
+    }
+
     pub fn deposit(
         env: Env,
         provider: Address,
@@ -1093,6 +1119,7 @@ impl RiskPool {
     ///
     /// Capped at `MAX_EXIT_DELAY` (30 days). An unbounded delay would be
     /// indistinguishable from freezing LP funds.
+    /// Rejects delays exceeding `MAX_EXIT_DELAY` with `ExitDelayTooLong` (issue #743).
     pub fn set_exit_delay(env: Env, admin: Address, delay_seconds: u64) {
         Self::require_admin(&env, &admin);
 
@@ -2158,6 +2185,11 @@ impl RiskPool {
         }
 
         // Apply the parameter change
+        if pending.new_lp_bps < 0 || pending.new_treas_bps < 0 || pending.new_backstop_bps < 0
+            || pending.new_lp_bps + pending.new_treas_bps + pending.new_backstop_bps != 10_000
+        {
+            panic_with_error!(&env, Error::InvalidSplit);
+        }
         let split = PremiumSplit {
             lp_bps: pending.new_lp_bps,
             treas_bps: pending.new_treas_bps,
@@ -2503,6 +2535,7 @@ impl RiskPool {
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
         Self::validate_stellar_address(&env, &new_admin);
+        Self::require_not_zero_address(&env, &new_admin);
 
         // Issue #457: reject a fresh proposal while one is already pending —
         // the armed transfer must complete (be accepted) before another can
@@ -2609,6 +2642,7 @@ impl RiskPool {
             panic_with_error!(&env, Error::Unauthorized);
         }
         admin.require_auth();
+        Self::require_not_zero_address(&env, &admin);
         let since: u64 = env.storage().instance()
             .get(&StorageKey::PendingAdminSince).unwrap_or(0);
         if env.ledger().timestamp() < since.saturating_add(ADMIN_TRANSFER_TIMELOCK) {
@@ -3178,6 +3212,20 @@ impl RiskPool {
                 amount,
             },
         );
+    }
+
+    /// Set or update the pool's human-readable name, enforcing length limits (issue #748).
+    pub fn set_pool_name(env: Env, admin: Address, name: String) {
+        Self::require_admin(&env, &admin);
+        if name.len() == 0 || name.len() > MAX_POOL_NAME_LEN {
+            panic_with_error!(&env, Error::NameTooLong);
+        }
+        env.storage().instance().set(&StorageKey::PoolName, &name);
+    }
+
+    /// Retrieve the pool's human-readable name if configured (issue #748).
+    pub fn get_pool_name(env: Env) -> Option<String> {
+        env.storage().instance().get(&StorageKey::PoolName)
     }
 }
 

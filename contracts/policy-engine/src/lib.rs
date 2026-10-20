@@ -93,6 +93,10 @@ enum StorageKey {
     RegisteredCategory(Symbol),
     /// Vec<Symbol> of all registered categories
     CategoryRegistry,
+    /// Maps oracle_data_type Symbol -> bool (whether registered) (issue #745)
+    RegisteredOracleDataType(Symbol),
+    /// Vec<Symbol> of all registered oracle data types (issue #745)
+    OracleDataTypeRegistry,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -153,6 +157,10 @@ pub enum Error {
     NotOracleGuardian = 43,
     OracleApprovalRequired = 44,
     AdminCannotBuyPolicy = 45,
+    /// Product description / name cannot be empty (issue #755).
+    EmptyDescription = 46,
+    /// Product description / name is too short (issue #755).
+    InvalidDescription = 47,
 }
 
 // SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
@@ -283,6 +291,26 @@ impl PolicyEngine {
         env.storage()
             .instance()
             .set(&StorageKey::CategoryRegistry, &default_categories);
+
+        let default_types: Vec<Symbol> = soroban_sdk::vec![
+            &env,
+            symbol_short!("weather"),
+            symbol_short!("flight"),
+            symbol_short!("disaster"),
+            symbol_short!("onchain"),
+            symbol_short!("defi"),
+            symbol_short!("health"),
+        ];
+        for i in 0..default_types.len() {
+            let dt = default_types.get_unchecked(i);
+            env.storage()
+                .persistent()
+                .set(&StorageKey::RegisteredOracleDataType(dt.clone()), &true);
+            Self::extend_to_max(&env, &StorageKey::RegisteredOracleDataType(dt));
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::OracleDataTypeRegistry, &default_types);
 
         env.events().publish(
             (Symbol::new(&env, "initialized"),),
@@ -428,6 +456,24 @@ impl PolicyEngine {
             panic_with_error!(&env, Error::InvalidCategory);
         }
 
+        // Product description / name must not be empty (issue #755).
+        if params.name == Symbol::new(&env, "") {
+            panic_with_error!(&env, Error::EmptyDescription);
+        }
+        {
+            let sym_val = params.name.to_symbol_val();
+            let sym_str: Result<SymbolStr, _> = SymbolStr::try_from_val(&env, &sym_val);
+            if let Ok(s) = sym_str {
+                let bytes: &[u8] = s.as_ref().as_bytes();
+                if bytes.is_empty() {
+                    panic_with_error!(&env, Error::EmptyDescription);
+                }
+                if bytes.len() < 3 {
+                    panic_with_error!(&env, Error::InvalidDescription);
+                }
+            }
+        }
+
         match params.trigger_type {
             TriggerType::Binary => {
                 if params.trigger_comparison != TriggerComparison::Equal {
@@ -439,6 +485,10 @@ impl PolicyEngine {
                     panic_with_error!(&env, Error::InvalidTriggerCombination);
                 }
             }
+        }
+
+        if !Self::is_oracle_data_type_registered(env.clone(), params.oracle_data_type.clone()) {
+            panic_with_error!(&env, Error::UnregisteredOracleDataType);
         }
 
         // SECURITY FIX: Validate oracle_data_type matches the product's trigger type.
@@ -786,6 +836,27 @@ impl PolicyEngine {
         Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, start_time, &payment_token)
     }
 
+    /// Buy an insurance policy asserting that the premium rate matches product bounds (issue #741).
+    pub fn buy_policy_with_rate(
+        env: Env,
+        buyer: Address,
+        product_id: u128,
+        coverage_amount: i128,
+        duration_days: u32,
+        oracle_key: Symbol,
+        payment_token: Address,
+        rate_bps: u32,
+    ) -> u128 {
+        buyer.require_auth();
+        Self::ensure_not_paused(&env);
+        let product: InsuranceProduct = Self::load_product(&env, product_id);
+        if rate_bps != product.premium_rate_bps || rate_bps == 0 || rate_bps > 5_000 {
+            panic_with_error!(&env, Error::InvalidPremiumRate);
+        }
+        let now = env.ledger().timestamp();
+        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, now, &payment_token)
+    }
+
     /// Buy multiple policies in a single atomic transaction.
     ///
     /// Up to `MAX_BATCH_BUY` policies may be purchased at once. If any single
@@ -906,6 +977,11 @@ impl PolicyEngine {
         if coverage_amount > 1_000_000_000_000 {
             panic_with_error!(env, Error::CoverageOutOfRange);
         }
+
+        // SECURITY FIX (issue #741): Validate product premium rate is within valid configured bounds (1..=5_000 bps)
+        if product.premium_rate_bps == 0 || product.premium_rate_bps > 5_000 {
+            panic_with_error!(env, Error::InvalidPremiumRate);
+        }
         
         // SECURITY FIX: Calculate the required premium based on product parameters.
         // This prevents callers from providing arbitrary premium amounts.
@@ -945,7 +1021,10 @@ impl PolicyEngine {
         let max_duration_secs = (product.max_duration_days as u64)
             .checked_mul(86_400)
             .unwrap_or(u64::MAX);
-        if end_time.saturating_sub(start_time) > max_duration_secs {
+        if end_time.saturating_sub(start_time) > max_duration_secs
+            || end_time > start_time.saturating_add(max_duration_secs)
+            || duration_days > product.max_duration_days
+        {
             panic_with_error!(env, Error::DurationTooLong);
         }
         let policy_id = Self::next_policy_id(env);
@@ -1426,6 +1505,58 @@ impl PolicyEngine {
             .instance()
             .get(&StorageKey::CategoryRegistry)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Admin-only: register a new oracle data type (issue #745).
+    pub fn register_oracle_data_type(env: Env, admin: Address, data_type: Symbol) {
+        Self::require_admin(&env, &admin);
+
+        let key = StorageKey::RegisteredOracleDataType(data_type.clone());
+        if !env.storage().persistent().get(&key).unwrap_or(false) {
+            env.storage().persistent().set(&key, &true);
+            Self::extend_to_max(&env, &key);
+
+            let mut types: Vec<Symbol> = env
+                .storage()
+                .instance()
+                .get(&StorageKey::OracleDataTypeRegistry)
+                .unwrap_or_else(|| Vec::new(&env));
+            types.push_back(data_type);
+            env.storage().instance().set(&StorageKey::OracleDataTypeRegistry, &types);
+        }
+    }
+
+    /// Return true if `data_type` is currently registered (issue #745).
+    pub fn is_oracle_data_type_registered(env: Env, data_type: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::RegisteredOracleDataType(data_type.clone()))
+            .unwrap_or_else(|| {
+                data_type == symbol_short!("weather")
+                    || data_type == symbol_short!("flight")
+                    || data_type == symbol_short!("disaster")
+                    || data_type == symbol_short!("onchain")
+                    || data_type == symbol_short!("defi")
+                    || data_type == symbol_short!("health")
+            })
+    }
+
+    /// Return all currently registered oracle data types (issue #745).
+    pub fn get_registered_oracle_data_types(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::OracleDataTypeRegistry)
+            .unwrap_or_else(|| {
+                soroban_sdk::vec![
+                    &env,
+                    symbol_short!("weather"),
+                    symbol_short!("flight"),
+                    symbol_short!("disaster"),
+                    symbol_short!("onchain"),
+                    symbol_short!("defi"),
+                    symbol_short!("health"),
+                ]
+            })
     }
 
     // ── Admin: emergency controls ─────────────────────────────────────────────

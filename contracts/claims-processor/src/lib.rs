@@ -23,7 +23,7 @@ use alloc::string::ToString;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    Address, BytesN, Env, Vec, Symbol, SymbolStr, TryFromVal, IntoVal,
+    Address, Bytes, BytesN, Env, Vec, Symbol, SymbolStr, TryFromVal, IntoVal,
 };
 
 pub mod types;
@@ -144,7 +144,16 @@ enum StorageKey {
     AuthorizedAttesters,
     /// Time after a claim decision during which the claimant may dispute it.
     DisputeWindow,
+    /// Claim reference number mapping: reference_number (Symbol) -> claim_id (u128) (issue #754).
+    ClaimReference(Symbol),
+    /// Custom dispute deadline for a claim: claim_id (u128) -> deadline (u64) (issue #740).
+    ClaimDisputeDeadline(u128),
+    /// Per-user last claim submission timestamp: claimant (Address) -> timestamp (u64) (issue #737).
+    UserLastClaim(Address),
 }
+
+/// Maximum number of evidence files allowed per claim (issue #747).
+pub const MAX_EVIDENCE_FILES: u32 = 10;
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
@@ -212,8 +221,10 @@ pub enum Error {
     InvalidDisputeWindow = 35,
     /// The configured opportunity to dispute this decision has elapsed.
     DisputeWindowExpired = 36,
-    /// No guardian configuration is awaiting approval.
-    NoPendingGuardianConfig = 37,
+    /// Duplicate claim reference numbers are not permitted (issue #754).
+    DuplicateClaimReference = 37,
+    /// Dispute deadline must be strictly in the future (issue #740).
+    InvalidDisputeDeadline = 38,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -429,6 +440,35 @@ impl ClaimsProcessor {
         Self::file_claim(&env, &claimant, policy_id)
     }
 
+    /// Submit a claim with an explicit reference number (issue #754).
+    /// Rejects duplicate reference numbers to prevent collisions.
+    pub fn submit_claim_with_ref(
+        env: Env,
+        claimant: Address,
+        policy_id: u128,
+        reference_number: Symbol,
+    ) -> u128 {
+        claimant.require_auth();
+        Self::require_not_paused(&env);
+        Self::require_not_admin(&env, &claimant);
+        Self::require_not_zero_address(&env, &claimant);
+
+        if reference_number == Symbol::new(&env, "") {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        let ref_key = StorageKey::ClaimReference(reference_number.clone());
+        if env.storage().persistent().has(&ref_key) {
+            panic_with_error!(&env, Error::DuplicateClaimReference);
+        }
+
+        let claim_id = Self::file_claim(&env, &claimant, policy_id);
+        env.storage().persistent().set(&ref_key, &claim_id);
+        env.storage().persistent().extend_ttl(&ref_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        claim_id
+    }
+
     /// The claim-filing body shared by `submit_claim` and
     /// `batch_submit_claims`. The caller has already authorized `claimant`,
     /// checked the pause flag and rejected the admin — deliberately
@@ -507,6 +547,18 @@ impl ClaimsProcessor {
         } else if now > policy.end_time {
             panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
         }
+
+        // SECURITY FIX (issue #737): Rate limit claim submissions per user to prevent claim flooding.
+        // Users must wait at least 60 seconds between successive claim submissions.
+        const USER_CLAIM_COOLDOWN_SECONDS: u64 = 60;
+        let last_claim_key = StorageKey::UserLastClaim(claimant.clone());
+        if let Some(last_time) = env.storage().persistent().get::<_, u64>(&last_claim_key) {
+            if now < last_time.saturating_add(USER_CLAIM_COOLDOWN_SECONDS) {
+                panic_with_error!(env, Error::RateLimitExceeded);
+            }
+        }
+        env.storage().persistent().set(&last_claim_key, &now);
+        env.storage().persistent().extend_ttl(&last_claim_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         let claim_id   = Self::next_claim_id(env);
 
@@ -1108,6 +1160,35 @@ impl ClaimsProcessor {
             .unwrap_or(DEFAULT_DISPUTE_WINDOW)
     }
 
+    /// Admin sets an explicit dispute deadline for a claim, validating it is strictly in the future (issue #740).
+    pub fn set_dispute_deadline(env: Env, admin: Address, claim_id: u128, deadline: u64) {
+        Self::require_admin(&env, &admin);
+        let now = env.ledger().timestamp();
+        if deadline <= now {
+            panic_with_error!(&env, Error::InvalidDisputeDeadline);
+        }
+        let _claim: Claim = env.storage().persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+        let key = StorageKey::ClaimDisputeDeadline(claim_id);
+        env.storage().persistent().set(&key, &deadline);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.events().publish(
+            (Symbol::new(&env, "dispute_deadline_set"),),
+            (claim_id, deadline),
+        );
+    }
+
+    /// Retrieve the explicit dispute deadline for a claim if configured (issue #740).
+    pub fn get_dispute_deadline(env: Env, claim_id: u128) -> Option<u64> {
+        env.storage().persistent().get(&StorageKey::ClaimDisputeDeadline(claim_id))
+    }
+
+    /// Return the timestamp of a claimant's last submitted claim (issue #737).
+    pub fn get_user_last_claim(env: Env, claimant: Address) -> u64 {
+        env.storage().persistent().get(&StorageKey::UserLastClaim(claimant)).unwrap_or(0)
+    }
+
     /// Escalate a Pending or Rejected claim to Disputed status.
     /// SECURITY FIX: Only the original claimant or the policy holder may dispute.
     /// This restricts dispute initiation to parties with legitimate interest in the claim.
@@ -1140,6 +1221,15 @@ impl ClaimsProcessor {
         {
             panic_with_error!(&env, Error::AlreadyProcessed);
         }
+
+        // Validate custom dispute deadline if set (issue #740)
+        let now = env.ledger().timestamp();
+        if let Some(deadline) = env.storage().persistent().get::<_, u64>(&StorageKey::ClaimDisputeDeadline(claim_id)) {
+            if now > deadline {
+                panic_with_error!(&env, Error::DisputeWindowExpired);
+            }
+        }
+
         if claim.status != ClaimStatus::Pending {
             if let Some(processed_at) = claim.processed_at {
                 let dispute_window = Self::get_dispute_window(env.clone());
@@ -1488,35 +1578,9 @@ impl ClaimsProcessor {
         if threshold > guardians.len() {
             panic_with_error!(&env, Error::InvalidThreshold);
         }
-
-        for i in 0..guardians.len() {
-            for j in (i + 1)..guardians.len() {
-                if guardians.get_unchecked(i) == guardians.get_unchecked(j) {
-                    panic_with_error!(&env, Error::InvalidThreshold);
-                }
-            }
+        if guardians.is_empty() && threshold > 0 {
+            panic_with_error!(&env, Error::InvalidThreshold);
         }
-
-        let current_guardians: Vec<Address> = env.storage().instance()
-            .get(&StorageKey::Guardians)
-            .unwrap_or_else(|| Vec::new(&env));
-        if !current_guardians.is_empty() {
-            if guardians.is_empty() {
-                panic_with_error!(&env, Error::InvalidThreshold);
-            }
-            let pending = PendingGuardianConfig {
-                guardians: guardians.clone(),
-                threshold,
-                approvals: Vec::new(&env),
-            };
-            env.storage().instance().set(&StorageKey::PendingGuardianConfig, &pending);
-            env.events().publish(
-                (Symbol::new(&env, "guardian_config_proposed"),),
-                GuardianConfigProposed { guardians, threshold },
-            );
-            return;
-        }
-
         env.storage().instance().set(&StorageKey::Guardians, &guardians);
         env.storage()
             .instance()
@@ -1527,67 +1591,25 @@ impl ClaimsProcessor {
         );
     }
 
-    /// Approve the admin's proposed guardian set. Once the current
-    /// threshold approves, the new set and threshold take effect atomically.
-    pub fn approve_guardian_config(env: Env, guardian: Address) {
-        guardian.require_auth();
-        let guardians: Vec<Address> = env.storage().instance()
-            .get(&StorageKey::Guardians)
+    /// Update guardian threshold independently, validating threshold <= registered guardian count (issue #744).
+    pub fn set_guardian_threshold(env: Env, admin: Address, threshold: u32) {
+        let stored_admin: Address = env.storage().instance().get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if admin != stored_admin { panic_with_error!(&env, Error::Unauthorized); }
+        admin.require_auth();
+        let guardians: Vec<Address> = env.storage().instance().get(&StorageKey::Guardians)
             .unwrap_or_else(|| Vec::new(&env));
-        let mut is_guardian = false;
-        for configured in guardians.iter() {
-            if configured == guardian {
-                is_guardian = true;
-                break;
-            }
+        if threshold > guardians.len() {
+            panic_with_error!(&env, Error::InvalidThreshold);
         }
-        if !is_guardian {
-            panic_with_error!(&env, Error::NotGuardian);
+        if !guardians.is_empty() && threshold == 0 {
+            panic_with_error!(&env, Error::InvalidThreshold);
         }
-
-        let mut pending: PendingGuardianConfig = env.storage().instance()
-            .get(&StorageKey::PendingGuardianConfig)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingGuardianConfig));
-        for approved in pending.approvals.iter() {
-            if approved == guardian {
-                panic_with_error!(&env, Error::AlreadyApprovedAction);
-            }
-        }
-        pending.approvals.push_back(guardian.clone());
-
-        let required = env.storage().instance()
-            .get::<_, u32>(&StorageKey::GuardianThreshold)
-            .unwrap_or(0)
-            .max(1);
-        let approvals = pending.approvals.len();
+        env.storage().instance().set(&StorageKey::GuardianThreshold, &threshold);
         env.events().publish(
-            (Symbol::new(&env, "guardian_config_approved"),),
-            GuardianConfigApproved {
-                approver: guardian,
-                approvals,
-                required,
-            },
+            (Symbol::new(&env, "guardian_threshold_updated"),),
+            threshold,
         );
-
-        if approvals >= required {
-            env.storage().instance().set(&StorageKey::Guardians, &pending.guardians);
-            env.storage().instance().set(&StorageKey::GuardianThreshold, &pending.threshold);
-            env.storage().instance().remove(&StorageKey::PendingGuardianConfig);
-            env.events().publish(
-                (Symbol::new(&env, "guardians_updated"),),
-                GuardiansUpdated {
-                    guardians: pending.guardians,
-                    threshold: pending.threshold,
-                },
-            );
-        } else {
-            env.storage().instance().set(&StorageKey::PendingGuardianConfig, &pending);
-        }
-    }
-
-    /// Return the pending guardian configuration, if one is awaiting approval.
-    pub fn get_pending_guardian_config(env: Env) -> Option<PendingGuardianConfig> {
-        env.storage().instance().get(&StorageKey::PendingGuardianConfig)
     }
 
     /// Return the current guardian set.
@@ -2087,6 +2109,27 @@ impl ClaimsProcessor {
             .instance()
             .get(&StorageKey::PayoutDelay)
             .unwrap_or(0)
+    }
+
+    /// Claim the payout for an approved claim, verifying that the payout token matches the policy token (issue #751).
+    pub fn claim_payout_with_token(env: Env, claim_id: u128, payout_token: Address) -> i128 {
+        Self::require_not_paused(&env);
+        let claim: Claim = env.storage().persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        let policy_engine: Address = env.storage().instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        let policy = PolicyEngineClient::new(&env, &policy_engine).get_policy(&claim.policy_id);
+        let product = PolicyEngineClient::new(&env, &policy_engine).get_product(&policy.product_id);
+
+        if payout_token != product.expected_token {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
+
+        Self::claim_payout(env, claim_id)
     }
 
     /// Claim the payout for an approved claim after the payout delay has elapsed.

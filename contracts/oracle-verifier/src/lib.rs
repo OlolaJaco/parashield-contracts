@@ -204,6 +204,8 @@ enum StorageKey {
     ChallengePeriod,
     /// Pending stake withdrawal request for (data_type, oracle).
     StakeWithdrawalReq(Symbol, Address),
+    /// Global registration tracker for oracle addresses across all data types (issue #742).
+    GlobalOracle(Address),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -254,6 +256,8 @@ pub enum Error {
     NoStakeWithdrawalRequest = 34,
     /// Stake withdrawal has already been requested (#681).
     WithdrawalAlreadyRequested = 35,
+    /// Oracle reputation score is out of bounds (0-1000 bps) (issue #749).
+    InvalidReputation = 36,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -310,6 +314,15 @@ impl OracleVerifier {
         if env.storage().persistent().has(&key) {
             panic_with_error!(&env, Error::OracleAlreadyExists);
         }
+
+        // SECURITY FIX (issue #742): Reject re-registration of the same oracle address
+        // under different IDs or across data types without prior de-registration.
+        let global_key = StorageKey::GlobalOracle(oracle.clone());
+        if env.storage().persistent().has(&global_key) {
+            panic_with_error!(&env, Error::OracleAlreadyExists);
+        }
+        env.storage().persistent().set(&global_key, &true);
+        env.storage().persistent().extend_ttl(&global_key, TTL_THRESHOLD, TTL_EXTEND_TO);
         
         // Sybil detection: Track which addresses control each oracle to prevent
         // the same entity from registering multiple oracles for the same data type.
@@ -1943,6 +1956,9 @@ impl OracleVerifier {
     /// Admin-only.
     pub fn set_stale_reputation_penalty(env: Env, admin: Address, reputation_lost: u32) {
         Self::require_admin(&env, &admin);
+        if reputation_lost > 1_000 {
+            panic_with_error!(&env, Error::InvalidReputation);
+        }
         env.storage()
             .instance()
             .set(&StorageKey::StaleReputationPenalty, &reputation_lost);
@@ -1950,6 +1966,27 @@ impl OracleVerifier {
             (Symbol::new(&env, "stale_reputation_penalty_updated"),),
             StaleReputationPenaltyUpdated { reputation_lost },
         );
+    }
+
+    /// Admin-only: explicitly set or override an oracle's reputation score (0..=1000 bps) (issue #749).
+    pub fn set_reputation(env: Env, admin: Address, oracle: Address, data_type: Symbol, score: u32) {
+        Self::require_admin(&env, &admin);
+        if score > 1_000 {
+            panic_with_error!(&env, Error::InvalidReputation);
+        }
+        let key = StorageKey::Reputation(data_type.clone(), oracle.clone());
+        let mut rep: OracleReputation = env.storage().persistent().get(&key).unwrap_or(OracleReputation {
+            oracle: oracle.clone(),
+            data_type: data_type.clone(),
+            total_submissions: 0,
+            accurate_submissions: 0,
+            score: 500,
+            last_updated: 0,
+        });
+        rep.score = score;
+        rep.last_updated = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &rep);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     /// Currently configured reputation basis-point penalty (`0` if unset).
@@ -1969,6 +2006,11 @@ impl OracleVerifier {
             .persistent()
             .get(&StorageKey::StaleCount(data_type, oracle))
             .unwrap_or(0)
+    }
+
+    /// Check whether an oracle address is already registered globally (issue #742).
+    pub fn is_oracle_registered(env: Env, oracle: Address) -> bool {
+        env.storage().persistent().has(&StorageKey::GlobalOracle(oracle))
     }
 
     /// Increment the stale-submission counter for this oracle + data_type
@@ -3412,6 +3454,7 @@ impl OracleVerifier {
             }
         }
         env.storage().instance().set(&StorageKey::OracleList(data_type.clone()), &pruned);
+        env.storage().persistent().remove(&StorageKey::GlobalOracle(oracle.clone()));
     }
 
     fn inactivity_limit(env: &Env) -> u64 {

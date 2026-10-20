@@ -224,6 +224,10 @@ pub enum Error {
     DuplicateProposal = 50,
     /// The proposed edge would point back to the delegator and close a cycle.
     CircularDelegation = 51,
+    /// A proposal template with this name already exists (issue #746).
+    DuplicateTemplateName = 52,
+    /// Vote weight must be strictly positive (> 0) (issue #739).
+    ZeroVoteWeight = 53,
 }
 
 #[contract]
@@ -832,10 +836,10 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::WeightAlreadyCounted);
         }
 
-        // 1. Capture voting balance weight
+        // 1. Capture voting balance weight - strictly positive weight required (issue #739)
         let own_weight = gov_token.balance(&voter);
         if own_weight <= 0 {
-            panic_with_error!(&env, Error::InsufficientWeight);
+            panic_with_error!(&env, Error::ZeroVoteWeight);
         }
 
         // Apply vote weight cap to prevent whale dominance (issue #431).
@@ -851,7 +855,7 @@ impl GovernanceDao {
         let delegated_weight = Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
         let weight = own_tally_weight.saturating_add(delegated_weight);
         if weight <= 0 {
-            panic_with_error!(&env, Error::InsufficientWeight);
+            panic_with_error!(&env, Error::ZeroVoteWeight);
         }
 
         // 3. Lock tokens in the DAO contract to prevent token cycling / double-voting
@@ -978,7 +982,7 @@ impl GovernanceDao {
         let gov_token = token::Client::new(&env, &config.gov_token);
         let own_weight = gov_token.balance(&voter);
         if own_weight <= 0 {
-            panic_with_error!(&env, Error::InsufficientWeight);
+            panic_with_error!(&env, Error::ZeroVoteWeight);
         }
 
         // Apply vote weight cap to prevent whale dominance (issue #431).
@@ -997,6 +1001,9 @@ impl GovernanceDao {
             let delegated_weight =
                 Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
             let weight = own_tally_weight.saturating_add(delegated_weight);
+            if weight <= 0 {
+                panic_with_error!(&env, Error::ZeroVoteWeight);
+            }
 
             match choice {
                 VoteChoice::For => proposal.votes_for += weight,
@@ -1714,6 +1721,9 @@ impl GovernanceDao {
         if enabled && floor_bps >= config.quorum_bps {
             panic_with_error!(&env, Error::InvalidQuorumDecay);
         }
+        if enabled && (floor_bps < MIN_QUORUM_BPS || floor_bps > MAX_QUORUM_BPS) {
+            panic_with_error!(&env, Error::QuorumTooLow);
+        }
         if enabled && (window == 0 || window > MAX_PARTICIPATION_WINDOW) {
             panic_with_error!(&env, Error::InvalidQuorumDecay);
         }
@@ -1894,6 +1904,10 @@ impl GovernanceDao {
         required_arg_count: u32,
     ) {
         Self::require_admin(&env, &admin);
+
+        if env.storage().instance().has(&StorageKey::Template(name.clone())) {
+            panic_with_error!(&env, Error::DuplicateTemplateName);
+        }
 
         let template = ProposalTemplate {
             name: name.clone(),
