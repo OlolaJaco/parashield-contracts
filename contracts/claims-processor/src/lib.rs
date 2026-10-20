@@ -546,6 +546,10 @@ impl ClaimsProcessor {
         if policy.policyholder != *claimant {
             panic_with_error!(env, Error::Unauthorized);
         }
+        // Guard: reject claims for cancelled policies (issue #731).
+        if policy.status == parashield_policy_engine::PolicyStatus::Cancelled {
+            panic_with_error!(env, Error::PolicyNotActive);
+        }
         if policy.status != parashield_policy_engine::PolicyStatus::Active {
             panic_with_error!(env, Error::PolicyNotActive);
         }

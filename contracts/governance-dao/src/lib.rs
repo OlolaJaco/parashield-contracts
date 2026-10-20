@@ -325,11 +325,10 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::TitleTooLong);
         }
         
-        // SECURITY FIX: Validate impact analysis length to prevent storage exhaustion.
-        // Limit to 4096 bytes — reasonable for a proposal description without enabling
-        // attacks that reserve huge storage or inflate transaction costs.
-        if impact_analysis.is_empty() {
-            panic_with_error!(&env, Error::InvalidInput);
+        // SECURITY FIX: Validate proposal description (impact_analysis) is not empty (issue #732).
+        // Enforce non-empty and minimum length to ensure informative proposals, bounded up to 4096 bytes.
+        if impact_analysis.is_empty() || impact_analysis.len() < 5 {
+            panic_with_error!(&env, Error::EmptyDescription);
         }
         if impact_analysis.len() > 4096 {
             panic_with_error!(&env, Error::InvalidInput);
@@ -1904,6 +1903,10 @@ impl GovernanceDao {
         required_arg_count: u32,
     ) {
         Self::require_admin(&env, &admin);
+
+        if description.is_empty() {
+            panic_with_error!(&env, Error::EmptyDescription);
+        }
 
         if env.storage().instance().has(&StorageKey::Template(name.clone())) {
             panic_with_error!(&env, Error::DuplicateTemplateName);

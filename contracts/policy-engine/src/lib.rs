@@ -218,6 +218,8 @@ impl PolicyEngine {
         if oracle_buf[0] != b'C' {
             panic_with_error!(&env, Error::InvalidAddress);
         }
+        // Reject zero address as oracle (issue #730)
+        Self::require_not_zero_address(&env, &oracle_address);
 
         let balance_res = env.try_invoke_contract::<i128, soroban_sdk::Error>(
             &usdc_token,
@@ -367,6 +369,8 @@ impl PolicyEngine {
         if oracle_buf[0] != b'C' {
             panic_with_error!(&env, Error::InvalidAddress);
         }
+        // Reject zero address as oracle (issue #730)
+        Self::require_not_zero_address(&env, &new_oracle);
 
         let change = PendingOracleChange {
             new_oracle: new_oracle.clone(),
@@ -2002,6 +2006,17 @@ impl PolicyEngine {
     }
 
     fn migrate_v2_to_v3(_env: &Env) {}
+
+    /// Require that an address is not the zero address (issue #730).
+    fn require_not_zero_address(env: &Env, address: &Address) {
+        let zero = Address::from_string(&soroban_sdk::String::from_str(
+            env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        if *address == zero {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
+    }
 }
 
 #[cfg(test)]

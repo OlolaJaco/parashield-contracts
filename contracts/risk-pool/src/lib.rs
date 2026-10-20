@@ -283,8 +283,8 @@ impl RiskPool {
         if env.storage().instance().has(&StorageKey::Initialized) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
-        // An empty category would make the pool's accounting and LP NFT
-        // metadata ambiguous, so reject it up front (issue #520).
+        // Category name cannot be empty and must describe a valid risk category (issue #729, #520).
+        // Empty category names are rejected to prevent unnamed categories in the pool registry.
         if category == Symbol::new(&env, "") {
             panic_with_error!(&env, Error::InvalidCategory);
         }
