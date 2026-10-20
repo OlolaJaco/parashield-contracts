@@ -85,6 +85,10 @@ enum StorageKey {
     /// Ledger timestamp (u64) of a buyer's last purchase on an oracle key,
     /// used to enforce `PURCHASE_COOLING_OFF_SECONDS` (issue #671).
     LastPurchase((Address, Symbol)),
+    /// Independent approver for oracle rotations.
+    OracleGuardian,
+    /// Proposed oracle rotation waiting for approval and its timelock.
+    PendingOracleChange,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -139,20 +143,28 @@ pub enum Error {
     /// The buyer already bought a policy on this oracle key within the
     /// cooling-off period (issue #671).
     CoolingOffActive = 39,
+    OracleChangePending = 40,
+    NoPendingOracleChange = 41,
+    OracleTimelockNotExpired = 42,
+    NotOracleGuardian = 43,
+    OracleApprovalRequired = 44,
+    AdminCannotBuyPolicy = 45,
 }
 
 // SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
 // Prevents an instantly-compromised admin key from immediately deploying malicious products.
 // Users have time to detect the compromise and intervene.
 const ADMIN_ACTION_TIMELOCK_SECONDS: u64 = 48 * 60 * 60;
+/// Oracle substitutions are equally security-sensitive: a replacement can
+/// determine every subsequent policy outcome, so users receive 48 hours to
+/// inspect an independently approved change before it executes.
+pub const ORACLE_CHANGE_TIMELOCK_SECONDS: u64 = 48 * 60 * 60;
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contract]
 pub struct PolicyEngine;
 
-#[cfg(any(test, feature = "testutils", not(feature = "library")))]
 #[contractimpl]
 impl PolicyEngine {
     // ── Lifecycle ────────────────────────────────────────────────────────────
@@ -270,6 +282,108 @@ impl PolicyEngine {
                 claims_processor: claims_processor.clone(),
             },
         );
+    }
+
+    /// Set the independent guardian that must approve every oracle rotation.
+    pub fn set_oracle_guardian(env: Env, admin: Address, guardian: Address) {
+        Self::require_admin(&env, &admin);
+        if guardian == admin {
+            panic_with_error!(&env, Error::NotOracleGuardian);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::OracleGuardian, &guardian);
+        env.events().publish(
+            (Symbol::new(&env, "oracle_guardian_updated"),),
+            guardian,
+        );
+    }
+
+    /// Propose an oracle contract replacement. A proposal cannot be replaced
+    /// while pending, preventing an admin from resetting its review history.
+    pub fn propose_oracle_change(env: Env, admin: Address, new_oracle: Address) {
+        Self::require_admin(&env, &admin);
+        if env.storage().instance().has(&StorageKey::PendingOracleChange) {
+            panic_with_error!(&env, Error::OracleChangePending);
+        }
+        let oracle_str = new_oracle.to_string();
+        if oracle_str.len() != 56 {
+            panic_with_error!(&env, Error::InvalidAddress);
+        }
+        let mut oracle_buf = [0u8; 56];
+        oracle_str.copy_into_slice(&mut oracle_buf);
+        if oracle_buf[0] != b'C' {
+            panic_with_error!(&env, Error::InvalidAddress);
+        }
+
+        let change = PendingOracleChange {
+            new_oracle: new_oracle.clone(),
+            execute_after: env
+                .ledger()
+                .timestamp()
+                .saturating_add(ORACLE_CHANGE_TIMELOCK_SECONDS),
+            guardian_approved: false,
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingOracleChange, &change);
+        env.events().publish(
+            (Symbol::new(&env, "oracle_change_proposed"),),
+            change,
+        );
+    }
+
+    /// Approve the pending replacement as the configured oracle guardian.
+    pub fn approve_oracle_change(env: Env, guardian: Address) {
+        guardian.require_auth();
+        let configured: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::OracleGuardian)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotOracleGuardian));
+        if guardian != configured {
+            panic_with_error!(&env, Error::NotOracleGuardian);
+        }
+        let mut change: PendingOracleChange = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingOracleChange)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingOracleChange));
+        change.guardian_approved = true;
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingOracleChange, &change);
+    }
+
+    /// Execute an approved oracle replacement once its 48-hour review period
+    /// has elapsed.
+    pub fn execute_oracle_change(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        let change: PendingOracleChange = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingOracleChange)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingOracleChange));
+        if !change.guardian_approved {
+            panic_with_error!(&env, Error::OracleApprovalRequired);
+        }
+        if env.ledger().timestamp() < change.execute_after {
+            panic_with_error!(&env, Error::OracleTimelockNotExpired);
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::OracleAddress, &change.new_oracle);
+        env.storage()
+            .instance()
+            .remove(&StorageKey::PendingOracleChange);
+        env.events().publish(
+            (Symbol::new(&env, "oracle_changed"),),
+            change.new_oracle,
+        );
+    }
+
+    pub fn get_pending_oracle_change(env: Env) -> Option<PendingOracleChange> {
+        env.storage().instance().get(&StorageKey::PendingOracleChange)
     }
 
     // ── Product Management (admin only) ──────────────────────────────────────

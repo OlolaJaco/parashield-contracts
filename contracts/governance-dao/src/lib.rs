@@ -1,1 +1,2729 @@
-@gov.rs
+//! Parashield Governance DAO
+//!
+//! Token-weighted governance over protocol parameters:
+//!   - Add/remove insurance products
+//!   - Adjust premium rates and trigger thresholds
+//!   - Add/remove oracle sources
+//!   - Spend protocol treasury
+//!   - Emergency pause / upgrade contracts
+//!
+//! Governance token: SHIELD (Stellar asset, tradeable on built-in DEX)
+//! Proposal lifecycle: Draft → Active → Passed/Rejected → Executed
+//! Quorum: configurable % of total supply; configurable majority to pass
+//!
+//! v2 — full implementation; DAO is now deployable and testable.
+// Address/state validation must fail with a typed contract error so callers
+// can match on it programmatically, never with a raw panic! and a string
+// message.
+#![deny(clippy::panic)]
+#![no_std]
+
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
+    BytesN, Env, IntoVal, Symbol, Val, Vec,
+};
+
+pub mod types;
+pub use types::*;
+
+// ─── Cross-contract client interfaces ────────────────────────────────────────
+
+#[soroban_sdk::contractclient(name = "RiskPoolClient")]
+trait IRiskPool {
+    fn get_delegated_shares(env: Env, provider: Address) -> i128;
+}
+
+/// Minimum voting period: 1 hour in seconds.
+const MIN_VOTING_PERIOD: u64 = 3_600;
+/// Maximum voting period: 30 days in seconds. Prevents an admin from setting
+/// an unreachably large period that would cause vote_end + FINALIZE_DELAY to
+/// overflow or make proposals permanently unresolvable.
+const MAX_VOTING_PERIOD: u64 = 30 * 24 * 3_600;
+// Shared protocol constants — single source of truth in parashield-common (issue #342).
+use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO};
+/// Minimum delay after vote_end before finalize() can be called
+const FINALIZE_DELAY: u64 = 300; // 5 minutes
+/// How long a proposal must sit unfinalized past `vote_end` before its
+/// proposer (or anyone, on the proposer's behalf) can reclaim the deposit
+/// directly via `reclaim_deposit`, bypassing the quorum/majority computation
+/// `finalize()` performs. `finalize()` is already permissionless and already
+/// refunds the deposit on every outcome, but nothing obliges anyone to ever
+/// call it — a proposal that clearly failed quorum has no one economically
+/// incentivized to pay for finalizing it. This is the backstop so a deposit
+/// can never depend on that goodwill (issue #378). Set well beyond
+/// `FINALIZE_DELAY` so the normal finalize path always gets first chance.
+const DEPOSIT_RECLAIM_TIMEOUT: u64 = 14 * 24 * 3_600; // 14 days
+/// Lower bound on `DaoConfig.quorum_bps` (issue #355). Without a floor the
+/// admin could configure `quorum_bps = 0`, letting a proposal pass on
+/// negligible turnout. 1000 = 10% of total supply must participate.
+const MIN_QUORUM_BPS: u32 = 1_000;
+/// Upper bound on `DaoConfig.quorum_bps` (issue #590). Without a ceiling the
+/// admin could set `quorum_bps = 100_001`, making quorum mathematically impossible
+/// and permanently bricking all proposals. 10_000 = 100% of total supply.
+const MAX_QUORUM_BPS: u32 = 10_000;
+/// Number of recent proposals averaged for participation when adaptive quorum
+/// is enabled without an explicit window.
+const DEFAULT_PARTICIPATION_WINDOW: u32 = 5;
+/// Upper bound on the participation window. Bounds both the stored history and
+/// the averaging loop.
+const MAX_PARTICIPATION_WINDOW: u32 = 20;
+/// Maximum delegators a single delegate may accept.
+///
+/// Bounds the loop that sums delegated weight at vote time — an unbounded
+/// delegate list would eventually make voting cost more instructions than a
+/// transaction can carry, which would lock that delegate out entirely.
+const MAX_DELEGATORS: u32 = 50;
+
+/// Impact-multiplier basis points floor: 10_000 = 1x. A multiplier below this
+/// would lower the deposit / weight requirement below the configured base,
+/// which is not what an escalation feature should ever do (issue #438).
+const MIN_MULTIPLIER_BPS: u32 = 10_000;
+
+/// Basis-point denominator for time-weighted voting power.
+const FULL_WEIGHT_BPS: u32 = 10_000;
+/// Impact-multiplier basis points ceiling: 100_000 = 10x. A single stray
+/// keystroke could otherwise brick proposal creation entirely by demanding
+/// more tokens than exist. Ten times the base is already an aggressive
+/// escalation and covers every realistic threat model without leaving a
+/// footgun.
+const MAX_MULTIPLIER_BPS: u32 = 100_000;
+// Recommended shipped defaults, documented on `ImpactMultipliers` in
+// `types.rs`: 1x for `standard_bps`, 5x for `upgrade_bps`, 3x for
+// `self_target_bps`. Not constants here because the setter is
+// value-driven — the admin passes explicit multipliers, not a "use
+// defaults" flag — so introducing named constants only for the doc
+// comment would leave `dead_code` in the crate.
+
+/// Maximum byte length for a proposal title (issue #584). Long titles waste
+/// storage and inflate transaction costs without adding governance value.
+const MAX_TITLE_LEN: u32 = 256;
+
+#[contracttype]
+enum StorageKey {
+    Initialized,
+    Admin,
+    Config,
+    NextProposalId,
+    Proposal(u64),
+    VoteRecord(u64, Address),
+    LockedBalance(u64, Address),
+    /// Contract version (u32) for storage migration tracking
+    Version,
+    /// Guardian addresses authorized to approve critical actions (Vec<Address>).
+    Guardians,
+    /// Number of guardian approvals required to execute a critical action
+    /// (u32). 0 means guardian multisig is disabled (admin acts alone).
+    GuardianThreshold,
+    /// A pending, not-yet-executed contract upgrade awaiting guardian approvals.
+    PendingUpgrade,
+    /// Adaptive-quorum settings (`QuorumDecayConfig`).
+    QuorumDecay,
+    /// Time-weighted voting settings (`TimeWeightConfig`).
+    TimeWeight,
+    /// A holder's `WeightCheckpoint` — Address → WeightCheckpoint.
+    WeightCheckpoint(Address),
+    /// Rolling turnout history used to compute adaptive quorum.
+    Participation,
+    /// Who an address has delegated its voting power to — Address → Address.
+    DelegateOf(Address),
+    /// Addresses currently delegating to an account — Address → Vec<Address>.
+    Delegators(Address),
+    /// Marks that a delegator's weight was already counted in a proposal, so
+    /// they cannot also vote it themselves — (proposal_id, delegator).
+    DelegatedVote(u64, Address),
+    /// A registered proposal template (`ProposalTemplate`) by name.
+    Template(Symbol),
+    /// Names of all registered templates (`Vec<Symbol>`).
+    TemplateList,
+    /// Risk pool contract address for querying LP vote delegation.
+    RiskPool,
+    /// On-chain audit trail record for executed proposal — proposal_id -> ExecutionAuditRecord.
+    ExecutionAudit(u64),
+    /// Proposal comment by ID — comment_id -> ProposalComment.
+    ProposalComment(u128),
+    /// Next comment ID counter for a proposal — proposal_id -> u128.
+    NextCommentId(u64),
+    /// Impact-based escalation multipliers applied on top of the base
+    /// `DaoConfig.proposal_threshold` at proposal creation time. Absent =
+    /// no escalation (behaves as 1x for every proposal kind). Issue #438.
+    ImpactMultipliers,
+    /// Maps a proposal content hash (SHA-256 of target+function+args) to a
+    /// proposal_id. Exists only while the proposal is open (Active or
+    /// Discussion). Cleared when the proposal resolves so the same action can
+    /// be re-proposed after the previous one closes. Issue #630.
+    ActiveProposalHash(BytesN<32>),
+}
+
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    InsufficientWeight = 4,
+    ProposalNotFound = 5,
+    ProposalNotActive = 6,
+    AlreadyVoted = 7,
+    VotingClosed = 8,
+    VotingStillOpen = 9,
+    ProposalNotPassed = 10,
+    AlreadyExecuted = 11,
+    AlreadyCancelled = 12,
+    TimelockNotExpired = 13,
+    FinalizeDelayNotMet = 14,
+    VersionNotNewer = 15,
+    LimitReached = 16,
+    VotingPeriodTooShort = 17,
+    VotingPeriodTooLong = 18,
+    InvalidAddress = 19,
+    NotGuardian = 20,
+    AlreadyApprovedAction = 21,
+    NoPendingUpgrade = 22,
+    InvalidThreshold = 23,
+    QuorumTooLow = 24,
+    InvalidQuorumDecay = 25,
+    SelfDelegation = 26,
+    NoDelegation = 27,
+    AlreadyDelegated = 28,
+    WeightAlreadyCounted = 29,
+    TooManyDelegators = 30,
+    ProposalNotExpired = 33,
+    TemplateNotFound = 34,
+    TemplateInactive = 35,
+    TitleTooShort = 36,
+    ArgCountMismatch = 37,
+    DiscussionPeriodNotEnded = 38,
+    DiscussionPeriodNotRequired = 39,
+    /// `vote_batch` was called with an empty proposal list.
+    NoProposals = 40,
+    InvalidInput = 41,
+    /// Proposal passed but execution deadline has expired without execution.
+    ExecutionDeadlineExpired = 42,
+    /// Proposal has been vetoed by a guardian and can never be executed.
+    ProposalVetoed = 43,
+    /// `finalize_batch` was called with more proposals than allowed.
+    BatchTooLarge = 46,
+    /// `set_impact_multipliers` was called with a multiplier below
+    /// `MIN_MULTIPLIER_BPS` (would de-escalate) or above `MAX_MULTIPLIER_BPS`
+    /// (would brick proposal creation). Issue #438.
+    InvalidImpactMultiplier = 44,
+    /// `set_time_weight` was called with a zero ramp period or a `min_bps`
+    /// above 10_000. Issue #515.
+    InvalidTimeWeight = 45,
+    /// Proposal description (title) cannot be empty. (issue #561)
+    EmptyDescription = 47,
+    /// Proposal title exceeds the maximum allowed length. (issue #584)
+    TitleTooLong = 48,
+    /// `quorum_bps` exceeds `MAX_QUORUM_BPS` (issue #590).
+    QuorumTooHigh = 49,
+    /// A proposal with the same target, function, and arguments already exists
+    /// and is still open (Active or Discussion). Duplicate proposals waste
+    /// governance resources and split voter attention (issue #630).
+    DuplicateProposal = 50,
+    /// The proposed edge would point back to the delegator and close a cycle.
+    CircularDelegation = 51,
+}
+
+#[contract]
+pub struct GovernanceDao;
+
+#[contractimpl]
+impl GovernanceDao {
+    /// Initialize the DAO. Can only be called once.
+    ///
+    /// Stores `admin` and `config` (gov token, quorum/majority thresholds,
+    /// voting period, timelock) and sets the proposal counter to 0.
+    pub fn initialize(env: Env, admin: Address, config: DaoConfig) {
+        if env.storage().instance().has(&StorageKey::Initialized) {
+            panic_with_error!(&env, Error::AlreadyInitialized);
+        }
+
+        // Address verification
+        let admin_str = admin.to_string();
+        
+        if admin_str.len() != 56 {
+            panic_with_error!(&env, Error::InvalidAddress);
+        }
+        let mut admin_buf = [0u8; 56];
+        admin_str.copy_into_slice(&mut admin_buf);
+        if admin_buf[0] != b'G' && admin_buf[0] != b'C' {
+            panic_with_error!(&env, Error::InvalidAddress);
+        }
+
+        let gov_token_str = config.gov_token.to_string();
+
+        if gov_token_str.len() != 56 {
+            panic_with_error!(&env, Error::InvalidAddress);
+        }
+        let mut gov_token_buf = [0u8; 56];
+        gov_token_str.copy_into_slice(&mut gov_token_buf);
+        if gov_token_buf[0] != b'C' {
+            panic_with_error!(&env, Error::InvalidAddress);
+        }
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::Initialized, &true);
+        if config.voting_period < MIN_VOTING_PERIOD {
+            panic_with_error!(&env, Error::VotingPeriodTooShort);
+        }
+        if config.voting_period > MAX_VOTING_PERIOD {
+            panic_with_error!(&env, Error::VotingPeriodTooLong);
+        }
+        if config.quorum_bps < MIN_QUORUM_BPS {
+            panic_with_error!(&env, Error::QuorumTooLow);
+        }
+        if config.quorum_bps > MAX_QUORUM_BPS {
+            panic_with_error!(&env, Error::QuorumTooHigh);
+        }
+        env.storage().instance().set(&StorageKey::Admin, &admin);
+        env.storage().instance().set(&StorageKey::Config, &config);
+        env.storage()
+            .instance()
+            .set(&StorageKey::NextProposalId, &0u64);
+
+        env.events().publish(
+            (Symbol::new(&env, "initialized"),),
+            Initialized {
+                admin: admin.clone(),
+                gov_token: config.gov_token.clone(),
+            },
+        );
+    }
+
+    // ── Proposals ─────────────────────────────────────────────────────────────
+
+    /// Create a new governance proposal targeting `target::function(args)`.
+    ///
+    /// The proposer must hold at least `config.proposal_threshold` gov
+    /// tokens; that exact amount is locked (transferred into the DAO) as a
+    /// deposit and is refunded verbatim by `finalize()`, regardless of any
+    /// later change to `config.proposal_threshold`.
+    pub fn create_proposal(
+        env: Env,
+        proposer: Address,
+        title: Bytes,
+        target: Address,
+        function: Symbol,
+        args: Vec<Val>,
+        impact_analysis: Bytes,
+    ) -> u64 {
+        proposer.require_auth();
+        Self::validate_stellar_address(&env, &target);
+        
+        if title.is_empty() {
+            panic_with_error!(&env, Error::EmptyDescription);
+        }
+        if title.len() > MAX_TITLE_LEN {
+            panic_with_error!(&env, Error::TitleTooLong);
+        }
+        
+        // SECURITY FIX: Validate impact analysis length to prevent storage exhaustion.
+        // Limit to 4096 bytes — reasonable for a proposal description without enabling
+        // attacks that reserve huge storage or inflate transaction costs.
+        if impact_analysis.is_empty() {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        if impact_analysis.len() > 4096 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        // Issue #630: reject proposals that duplicate an open one.
+        // Two proposals are duplicates when they target the same contract,
+        // call the same function, and pass identical arguments — the title
+        // and impact analysis are cosmetic and irrelevant to the on-chain
+        // effect. A different title does not make a different governance
+        // action; it just splits voter attention and wastes deposit capital.
+        let content_hash = Self::proposal_content_hash(&env, &target, &function, &args);
+        let hash_key = StorageKey::ActiveProposalHash(content_hash.clone());
+        if let Some(existing_id) = env.storage().instance().get::<_, u64>(&hash_key) {
+            // Only block if the existing proposal is still open. Once it
+            // resolves the hash is cleared (see finalize/cancel/reclaim_deposit)
+            // and the same action can be re-proposed legitimately.
+            if let Some(existing) = env
+                .storage()
+                .persistent()
+                .get::<_, Proposal>(&StorageKey::Proposal(existing_id))
+            {
+                if existing.status == ProposalStatus::Active
+                    || existing.status == ProposalStatus::Discussion
+                {
+                    panic_with_error!(&env, Error::DuplicateProposal);
+                }
+            }
+        }
+
+        let config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        // Issue #438: apply impact-based escalation on top of the base
+        // threshold. `ProposalKind::Standard` with target == this contract
+        // pays the self-target multiplier so a proposer cannot bypass
+        // upgrade-tier gating by wrapping a self-mutation in a Standard call.
+        let deposit = Self::effective_threshold(&env, &ProposalKind::Standard, &target);
+
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        let weight = gov_token.balance(&proposer);
+        if weight < deposit {
+            panic_with_error!(&env, Error::InsufficientWeight);
+        }
+
+        let proposal_id: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::NextProposalId)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+
+        let discussion_period = config.discussion_period;
+        let (status, vote_end) = if discussion_period > 0 {
+            // Proposal enters Discussion; voting opens after the period elapses.
+            (ProposalStatus::Discussion, now.saturating_add(discussion_period).saturating_add(config.voting_period))
+        } else {
+            (ProposalStatus::Active, now.saturating_add(config.voting_period))
+        };
+
+        let proposal = Proposal {
+            id: proposal_id,
+            proposer: proposer.clone(),
+            title,
+            target: target.clone(),
+            function: function.clone(),
+            args,
+            deposit,
+            status,
+            votes_for: 0,
+            votes_against: 0,
+            votes_abstain: 0,
+            created_at: now,
+            vote_end,
+            execution_time: 0,
+            execution_deadline: vote_end.saturating_add(FINALIZE_DELAY).saturating_add(7 * 24 * 3600),
+            total_supply: config.total_supply,
+            kind: ProposalKind::Standard,
+            impact_analysis,
+            verification_callback: None,
+            execution_verified: true,
+            is_vetoed: false,
+        };
+
+        let proposal_key = StorageKey::Proposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+        env.storage()
+            .instance()
+            .set(&StorageKey::NextProposalId, &(proposal_id.checked_add(1).unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))));
+
+        // Issue #630: register the content hash so a concurrent or subsequent
+        // identical proposal is detected and rejected while this one is open.
+        env.storage()
+            .instance()
+            .set(&hash_key, &proposal_id);
+
+        // Issue #519: pull the deposit only after every check and state write
+        // above has succeeded, so a failure in proposal creation can never
+        // leave the proposer's tokens locked without a matching proposal.
+        // Lock the exact amount that gated this proposal; finalize() refunds
+        // it verbatim from the Proposal record, so a later change to the
+        // base threshold or the multipliers does not distort refunds already
+        // in flight.
+        gov_token.transfer(
+            &proposer,
+            &env.current_contract_address(),
+            &deposit,
+        );
+
+        // Note: You can append `args` to your event payload if necessary
+        env.events().publish(
+            (Symbol::new(&env, "proposal_created"),),
+            ProposalCreated {
+                proposal_id,
+                proposer,
+                target,
+                function,
+            },
+        );
+
+        proposal_id
+    }
+
+    /// Create a proposal that, on execution, upgrades `target`'s contract
+    /// WASM to `new_wasm_hash`. `target` must have this DAO's own address
+    /// configured as its admin — `execute()` invokes
+    /// `target::upgrade(dao_address, new_wasm_hash)` on the DAO's behalf, so
+    /// contract-upgrade authorization becomes a first-class governance
+    /// action instead of living solely with a single admin key.
+    ///
+    /// Shares the same threshold/deposit/vote/finalize/timelock lifecycle as
+    /// `create_proposal`; only the proposal `kind` and pre-built
+    /// target/function/args differ.
+    pub fn propose_upgrade(
+        env: Env,
+        proposer: Address,
+        title: Bytes,
+        target: Address,
+        new_wasm_hash: BytesN<32>,
+        impact_analysis: Bytes,
+    ) -> u64 {
+        proposer.require_auth();
+        Self::validate_stellar_address(&env, &target);
+        
+        // Validate impact analysis is provided (non-empty)
+        if impact_analysis.is_empty() {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        // Enforce maximum length for impact analysis (4096 bytes)
+        if impact_analysis.len() > 4096 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        // Issue #630: build the upgrade args early so we can compute the
+        // content hash before touching any config or state.
+        let upgrade_function = Symbol::new(&env, "upgrade");
+        let mut upgrade_args: Vec<Val> = Vec::new(&env);
+        upgrade_args.push_back(env.current_contract_address().into_val(&env));
+        upgrade_args.push_back(new_wasm_hash.clone().into_val(&env));
+
+        let upgrade_content_hash = Self::proposal_content_hash(&env, &target, &upgrade_function, &upgrade_args);
+        let upgrade_hash_key = StorageKey::ActiveProposalHash(upgrade_content_hash.clone());
+        if let Some(existing_id) = env.storage().instance().get::<_, u64>(&upgrade_hash_key) {
+            if let Some(existing) = env
+                .storage()
+                .persistent()
+                .get::<_, Proposal>(&StorageKey::Proposal(existing_id))
+            {
+                if existing.status == ProposalStatus::Active
+                    || existing.status == ProposalStatus::Discussion
+                {
+                    panic_with_error!(&env, Error::DuplicateProposal);
+                }
+            }
+        }
+
+        let config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        // Issue #438: contract upgrades are the highest-impact governance
+        // action; apply the Upgrade multiplier on top of the base threshold.
+        let deposit = Self::effective_threshold(&env, &ProposalKind::Upgrade, &target);
+
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        let weight = gov_token.balance(&proposer);
+        if weight < deposit {
+            panic_with_error!(&env, Error::InsufficientWeight);
+        }
+
+        let proposal_id: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::NextProposalId)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+
+        // Re-use the args and function built earlier for the duplicate check.
+        let args = upgrade_args;
+        let function = upgrade_function;
+
+        let discussion_period = config.discussion_period;
+        let (status, vote_end) = if discussion_period > 0 {
+            (ProposalStatus::Discussion, now.saturating_add(discussion_period).saturating_add(config.voting_period))
+        } else {
+            (ProposalStatus::Active, now.saturating_add(config.voting_period))
+        };
+
+        let proposal = Proposal {
+            id: proposal_id,
+            proposer: proposer.clone(),
+            title,
+            target: target.clone(),
+            function: function.clone(),
+            args,
+            deposit,
+            status,
+            votes_for: 0,
+            votes_against: 0,
+            votes_abstain: 0,
+            created_at: now,
+            vote_end,
+            execution_time: 0,
+            execution_deadline: vote_end.saturating_add(FINALIZE_DELAY).saturating_add(7 * 24 * 3600),
+            total_supply: config.total_supply,
+            kind: ProposalKind::Upgrade,
+            impact_analysis,
+            verification_callback: None,
+            execution_verified: true,
+            is_vetoed: false,
+        };
+
+        let proposal_key = StorageKey::Proposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+        env.storage().instance().set(
+            &StorageKey::NextProposalId,
+            &(proposal_id
+                .checked_add(1)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))),
+        );
+
+        // Issue #630: register the content hash for this upgrade proposal.
+        env.storage()
+            .instance()
+            .set(&upgrade_hash_key, &proposal_id);
+
+        // Issue #519: pull the deposit only after every check and state write
+        // above has succeeded, so a failure in proposal creation can never
+        // leave the proposer's tokens locked without a matching proposal.
+        gov_token.transfer(&proposer, &env.current_contract_address(), &deposit);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_created"),),
+            ProposalCreated {
+                proposal_id,
+                proposer,
+                target,
+                function,
+            },
+        );
+
+        proposal_id
+    }
+
+    // ── Delegation (issue #363) ───────────────────────────────────────────────
+
+    /// Delegate this account's voting power to `delegate`.
+    ///
+    /// Delegation moves *authority*, not tokens. The delegator keeps custody of
+    /// their balance throughout — the DAO counts it toward the delegate's vote
+    /// at the moment that vote is cast, and the delegator can revoke at any
+    /// time. That matters: a design that required transferring tokens to a
+    /// delegate would make delegation a custody decision, which is a far higher
+    /// bar than the participation problem it is meant to solve.
+    ///
+    /// Weight is read live at vote time rather than snapshotted here, so a
+    /// delegator who sells their tokens stops lending weight they no longer
+    /// have.
+    ///
+    /// One hop only. Delegating to someone who has themselves delegated is
+    /// rejected: chains make the weight behind a vote impossible to see, and a
+    /// cycle would let weight be counted more than once.
+    pub fn delegate(env: Env, delegator: Address, delegate: Address) {
+        delegator.require_auth();
+
+        if delegator == delegate {
+            panic_with_error!(&env, Error::SelfDelegation);
+        }
+
+        // Refuse to build a chain — the delegate must vote for themselves.
+        if let Some(delegate_target) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&StorageKey::DelegateOf(delegate.clone()))
+        {
+            if delegate_target == delegator {
+                panic_with_error!(&env, Error::CircularDelegation);
+            }
+            panic_with_error!(&env, Error::SelfDelegation);
+        }
+
+        // A delegator cannot be a delegate: allowing both would create the
+        // same ambiguity as a chain, one hop later.
+        let own_delegators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Delegators(delegator.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        if !own_delegators.is_empty() {
+            panic_with_error!(&env, Error::SelfDelegation);
+        }
+
+        let existing: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DelegateOf(delegator.clone()));
+        if let Some(current) = existing {
+            if current == delegate {
+                panic_with_error!(&env, Error::AlreadyDelegated);
+            }
+            // Re-pointing an existing delegation: detach from the old delegate
+            // first so their list cannot keep a stale entry.
+            Self::remove_delegator(&env, &current, &delegator);
+        }
+
+        let mut delegators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Delegators(delegate.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if delegators.len() >= MAX_DELEGATORS {
+            panic_with_error!(&env, Error::TooManyDelegators);
+        }
+        delegators.push_back(delegator.clone());
+
+        env.storage()
+            .persistent()
+            .set(&StorageKey::DelegateOf(delegator.clone()), &delegate);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Delegators(delegate.clone()), &delegators);
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let weight = token::Client::new(&env, &config.gov_token).balance(&delegator);
+
+        env.events().publish(
+            (Symbol::new(&env, "power_delegated"),),
+            VotingPowerDelegated {
+                delegator: delegator.clone(),
+                delegate: delegate.clone(),
+                weight,
+            },
+        );
+
+        // Track delegation creation for off-chain indexing
+        env.events().publish(
+            (Symbol::new(&env, "delegation_recorded"),),
+            DelegationRecorded {
+                delegator,
+                delegate,
+                action: Symbol::new(&env, "created"),
+                recorded_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Withdraw a delegation, returning voting authority to the delegator.
+    ///
+    /// Effective immediately for any proposal the delegate has not already
+    /// voted on. Votes already cast are not unwound — the weight was counted
+    /// when the vote was recorded, and retroactively removing it would let a
+    /// delegator silently reverse a decision after the fact.
+    pub fn revoke_delegation(env: Env, delegator: Address) {
+        delegator.require_auth();
+
+        let delegate: Address = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::DelegateOf(delegator.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDelegation));
+
+        env.storage()
+            .persistent()
+            .remove(&StorageKey::DelegateOf(delegator.clone()));
+        Self::remove_delegator(&env, &delegate, &delegator);
+
+        env.events().publish(
+            (Symbol::new(&env, "delegation_revoked"),),
+            DelegationRevoked {
+                delegator: delegator.clone(),
+                delegate: delegate.clone(),
+            },
+        );
+
+        // Track delegation revocation for off-chain indexing
+        env.events().publish(
+            (Symbol::new(&env, "delegation_recorded"),),
+            DelegationRecorded {
+                delegator,
+                delegate,
+                action: Symbol::new(&env, "revoked"),
+                recorded_at: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    /// Who this address has delegated to, if anyone.
+    pub fn get_delegate(env: Env, delegator: Address) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::DelegateOf(delegator))
+    }
+
+    /// A delegate's standing: who delegates to them, and what a vote cast right
+    /// now would carry.
+    ///
+    /// Weight is computed from live balances, so this is a projection rather
+    /// than a promise — a delegator who moves tokens before the vote changes
+    /// the answer.
+    pub fn get_delegate_info(env: Env, delegate: Address) -> DelegateInfo {
+        let delegators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Delegators(delegate.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let gov_token = token::Client::new(&env, &config.gov_token);
+
+        let mut delegated_weight: i128 = 0;
+        for i in 0..delegators.len() {
+            delegated_weight =
+                delegated_weight.saturating_add(gov_token.balance(&delegators.get_unchecked(i)));
+        }
+
+        let own_weight = gov_token.balance(&delegate);
+
+        DelegateInfo {
+            delegate,
+            delegators,
+            delegated_weight,
+            own_weight,
+            total_weight: own_weight.saturating_add(delegated_weight),
+        }
+    }
+
+    /// Cast a vote (For/Against/Abstain) on an Active proposal.
+    ///
+    /// The voter's entire current gov-token balance is used as their vote
+    /// weight and is transferred into (locked in) the DAO contract for the
+    /// duration of the vote — this prevents transferring the same tokens to
+    /// another address to vote again ("token cycling"). The locked amount
+    /// is released later via `withdraw_tokens`, once the proposal is no
+    /// longer Active. Each address may vote at most once per proposal.
+
+    pub fn vote(env: Env, voter: Address, proposal_id: u64, choice: VoteChoice) {
+        voter.require_auth();
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        if proposal.status == ProposalStatus::Discussion {
+            panic_with_error!(&env, Error::DiscussionPeriodNotEnded);
+        }
+        if proposal.status != ProposalStatus::Active {
+            panic_with_error!(&env, Error::ProposalNotActive);
+        }
+        if env.ledger().timestamp() > proposal.vote_end {
+            panic_with_error!(&env, Error::VotingClosed);
+        }
+        let vote_key = StorageKey::VoteRecord(proposal_id, voter.clone());
+        if env.storage().persistent().has(&vote_key) {
+            panic_with_error!(&env, Error::AlreadyVoted);
+        }
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let gov_token = token::Client::new(&env, &config.gov_token);
+
+        // A holder who has delegated has handed their authority away. Letting
+        // them vote too would count the same tokens twice — once here, once in
+        // their delegate's tally.
+        if env
+            .storage()
+            .persistent()
+            .has(&StorageKey::DelegateOf(voter.clone()))
+        {
+            panic_with_error!(&env, Error::WeightAlreadyCounted);
+        }
+
+        // Likewise if a delegate has already voted and swept this holder's
+        // weight into their own tally.
+        if env
+            .storage()
+            .persistent()
+            .has(&StorageKey::DelegatedVote(proposal_id, voter.clone()))
+        {
+            panic_with_error!(&env, Error::WeightAlreadyCounted);
+        }
+
+        // 1. Capture voting balance weight
+        let own_weight = gov_token.balance(&voter);
+        if own_weight <= 0 {
+            panic_with_error!(&env, Error::InsufficientWeight);
+        }
+
+        // Apply vote weight cap to prevent whale dominance (issue #431).
+        let capped_own_weight = if config.vote_weight_cap > 0 {
+            core::cmp::min(own_weight, config.vote_weight_cap)
+        } else {
+            own_weight
+        };
+        let own_tally_weight = Self::time_weighted(&env, &voter, capped_own_weight);
+
+        // 2. Add any weight delegated to this voter, recording each delegator
+        //    so they cannot also vote this proposal themselves.
+        let delegated_weight = Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
+        let weight = own_tally_weight.saturating_add(delegated_weight);
+        if weight <= 0 {
+            panic_with_error!(&env, Error::InsufficientWeight);
+        }
+
+        // 3. Lock tokens in the DAO contract to prevent token cycling / double-voting
+        //
+        // Only the voter's own tokens are locked. Delegated weight is counted,
+        // never custodied — the DAO has no authority to move a delegator's
+        // balance, and taking it would turn delegation into a custody decision.
+        gov_token.transfer(&voter, &env.current_contract_address(), &capped_own_weight);
+
+        // Save the tracked locked balance for later retrieval
+        // Only the voter's own tokens were transferred in, so only that amount
+        // is refundable — refunding `weight` would pay out delegated balances
+        // the contract never held.
+        let lock_key = StorageKey::LockedBalance(proposal_id, voter.clone());
+        env.storage().persistent().set(&lock_key, &capped_own_weight);
+
+        match choice {
+            VoteChoice::For => proposal.votes_for += weight,
+            VoteChoice::Against => proposal.votes_against += weight,
+            VoteChoice::Abstain => proposal.votes_abstain += weight,
+        }
+
+        env.storage().persistent().set(
+            &vote_key,
+            &VoteRecord {
+                voter: voter.clone(),
+                choice: choice.clone(),
+                weight,
+            },
+        );
+        let proposal_key = StorageKey::Proposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "vote_cast"),),
+            VoteCast {
+                proposal_id,
+                voter,
+                choice,
+                weight,
+            },
+        );
+    }
+
+    /// Cast the same `choice` across several proposals in a single transaction
+    /// (issue #387). Voting on related proposals one at a time is tedious and
+    /// re-authorizes the same tokens repeatedly; a batch of bundled parameter
+    /// changes should be decided together, with a single vote.
+    ///
+    /// The caller's own tokens are locked exactly once for the whole batch —
+    /// they are custodied by the DAO for the duration of any still-active
+    /// proposal. The real lock is attributed to the first proposal; the others
+    /// share it (see `withdraw_tokens`, which no-ops for the shared ones, and
+    /// refunds the full amount exactly once through the first).
+    pub fn vote_batch(env: Env, voter: Address, proposal_ids: Vec<u64>, choice: VoteChoice) {
+        voter.require_auth();
+
+        if proposal_ids.is_empty() {
+            panic_with_error!(&env, Error::NoProposals);
+        }
+
+        // Issue #456: validate the batch's arguments before touching any
+        // state. The batch carries one shared `choice`, so the "proposal
+        // count must match the vote arguments" contract collapses to: every
+        // entry must name a distinct proposal. A repeated id passes Pass 1
+        // (no vote record exists yet) but is processed twice in Pass 2 — the
+        // second pass re-tallies from a stale copy and, worse, overwrites the
+        // first proposal's token lock with 0, stranding the voter's locked
+        // balance with no refund path through `withdraw_tokens`.
+        for i in 0..proposal_ids.len() {
+            let proposal_id = proposal_ids.get_unchecked(i);
+            for j in (i + 1)..proposal_ids.len() {
+                if proposal_ids.get_unchecked(j) == proposal_id {
+                    panic_with_error!(&env, Error::InvalidInput);
+                }
+            }
+        }
+
+        // A holder who has delegated away their vote cannot also vote it.
+        if env
+            .storage()
+            .persistent()
+            .has(&StorageKey::DelegateOf(voter.clone()))
+        {
+            panic_with_error!(&env, Error::WeightAlreadyCounted);
+        }
+
+        // Pass 1 — validate every proposal before mutating any state, so a
+        // batch is all-or-nothing and never leaves a partial tally behind.
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let mut proposals: Vec<Proposal> = Vec::new(&env);
+        for i in 0..proposal_ids.len() {
+            let proposal_id = proposal_ids.get_unchecked(i);
+            let proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&StorageKey::Proposal(proposal_id))
+                .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+            if proposal.status == ProposalStatus::Discussion {
+                panic_with_error!(&env, Error::DiscussionPeriodNotEnded);
+            }
+            if proposal.status != ProposalStatus::Active {
+                panic_with_error!(&env, Error::ProposalNotActive);
+            }
+            if env.ledger().timestamp() > proposal.vote_end {
+                panic_with_error!(&env, Error::VotingClosed);
+            }
+            let vote_key = StorageKey::VoteRecord(proposal_id, voter.clone());
+            if env.storage().persistent().has(&vote_key) {
+                panic_with_error!(&env, Error::AlreadyVoted);
+            }
+            if env
+                .storage()
+                .persistent()
+                .has(&StorageKey::DelegatedVote(proposal_id, voter.clone()))
+            {
+                panic_with_error!(&env, Error::WeightAlreadyCounted);
+            }
+            proposals.push_back(proposal);
+        }
+
+        // Pass 2 — lock the voter's own tokens once, then tally each proposal.
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        let own_weight = gov_token.balance(&voter);
+        if own_weight <= 0 {
+            panic_with_error!(&env, Error::InsufficientWeight);
+        }
+
+        // Apply vote weight cap to prevent whale dominance (issue #431).
+        let capped_own_weight = if config.vote_weight_cap > 0 {
+            core::cmp::min(own_weight, config.vote_weight_cap)
+        } else {
+            own_weight
+        };
+        let own_tally_weight = Self::time_weighted(&env, &voter, capped_own_weight);
+        gov_token.transfer(&voter, &env.current_contract_address(), &capped_own_weight);
+
+        for i in 0..proposal_ids.len() {
+            let proposal_id = proposal_ids.get_unchecked(i);
+            let mut proposal = proposals.get_unchecked(i);
+
+            let delegated_weight =
+                Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
+            let weight = own_tally_weight.saturating_add(delegated_weight);
+
+            match choice {
+                VoteChoice::For => proposal.votes_for += weight,
+                VoteChoice::Against => proposal.votes_against += weight,
+                VoteChoice::Abstain => proposal.votes_abstain += weight,
+            }
+
+            let vote_key = StorageKey::VoteRecord(proposal_id, voter.clone());
+            env.storage().persistent().set(
+                &vote_key,
+                &VoteRecord {
+                    voter: voter.clone(),
+                    choice: choice.clone(),
+                    weight,
+                },
+            );
+
+            // The tokens were locked once for the whole batch. Attribute the
+            // real lock to the first proposal only; `withdraw_tokens` treats the
+            // rest as sharing that lock and no-ops for them.
+            let lock_amount = if i == 0 { capped_own_weight } else { 0 };
+            env.storage()
+                .persistent()
+                .set(&StorageKey::LockedBalance(proposal_id, voter.clone()), &lock_amount);
+
+            env.storage()
+                .persistent()
+                .set(&StorageKey::Proposal(proposal_id), &proposal);
+
+            env.events().publish(
+                (Symbol::new(&env, "vote_cast"),),
+                VoteCast {
+                    proposal_id,
+                    voter: voter.clone(),
+                    choice: choice.clone(),
+                    weight,
+                },
+            );
+        }
+    }
+
+    /// Withdraw gov tokens that were locked by `vote()` on `proposal_id`.
+    ///
+    /// Only available once the proposal is no longer Active (i.e. after
+    /// `finalize()` or `cancel()`). Returns the voter's full locked balance
+    /// and clears the lock record so it cannot be withdrawn twice.
+    pub fn withdraw_tokens(env: Env, voter: Address, proposal_id: u64) {
+        voter.require_auth();
+
+        let proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        // Prevent withdrawing while voting is still active
+        if proposal.status == ProposalStatus::Active {
+            panic_with_error!(&env, Error::ProposalNotActive);
+        }
+
+        let lock_key = StorageKey::LockedBalance(proposal_id, voter.clone());
+        let locked_amount: i128 = env.storage().persistent().get(&lock_key).unwrap_or(0);
+
+        if locked_amount <= 0 {
+            // A `vote_batch` call locks the voter's tokens once and attributes
+            // the real lock to its first proposal. The remaining proposals in
+            // the batch share that lock, so they correctly have no refundable
+            // balance of their own — the tokens are returned exactly once via
+            // the first proposal. If a vote record exists, this is that shared
+            // case; otherwise there is genuinely nothing to withdraw.
+            if env
+                .storage()
+                .persistent()
+                .has(&StorageKey::VoteRecord(proposal_id, voter.clone()))
+            {
+                return;
+            }
+            panic_with_error!(&env, Error::InsufficientWeight);
+        }
+
+        // Clear tracking storage entry to prevent double-withdrawals
+        env.storage().persistent().remove(&lock_key);
+
+        // Refund the tokens back to the voter
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        gov_token.transfer(&env.current_contract_address(), &voter, &locked_amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "tokens_withdrawn"),),
+            (proposal_id, voter, locked_amount),
+        );
+    }
+
+    /// Close voting on an Active proposal and settle it to Passed or Failed.
+    ///
+    /// Callable by anyone once `vote_end + FINALIZE_DELAY` has passed (the
+    /// delay buffer prevents finalize being raced at the exact close of
+    /// voting). Quorum is `total_votes >= total_supply * quorum_bps /
+    /// 10_000`, using the `total_supply` snapshotted at proposal creation,
+    /// where `total_votes` includes For, Against, *and* Abstain — an
+    /// abstaining holder still shows up for participation purposes. If
+    /// quorum is met, the proposal Passes only when `votes_for * 10_000 /
+    /// (votes_for + votes_against) >= majority_bps`; Abstain is excluded
+    /// from this ratio entirely, so it counts toward quorum but never
+    /// drags down (or props up) the For/Against split (issue #385). A
+    /// proposal with no partisan (For/Against) votes at all — e.g.
+    /// everyone abstained — has no majority to speak of and Fails, as does
+    /// the exact-tie case (which lands at exactly 50%). Passing also
+    /// starts the execution timelock (`execution_time = now +
+    /// proposal_timelock`). The proposer's original deposit is refunded in
+    /// both outcomes.
+    pub fn finalize(env: Env, proposal_id: u64) {
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        if proposal.status != ProposalStatus::Active {
+            panic_with_error!(&env, Error::ProposalNotActive);
+        }
+
+        // Enforce the validation buffer delay to prevent immediate edge execution races
+        if env.ledger().timestamp() <= proposal.vote_end + FINALIZE_DELAY {
+            panic_with_error!(&env, Error::FinalizeDelayNotMet);
+        }
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let total_supply = proposal.total_supply;
+        
+        // SECURITY FIX: Only count For + Against votes toward quorum, not Abstain
+        // This prevents a proposal from passing with only abstain votes
+        let partisan_votes = proposal.votes_for + proposal.votes_against;
+        let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
+
+        // Adaptive quorum: after a run of low-turnout votes the requirement
+        // relaxes toward the configured floor, so a quiet DAO stays governable
+        // instead of deadlocking on proposals nobody can pass. Disabled by
+        // default, and never able to fall below MIN_QUORUM_BPS.
+        let effective = Self::effective_quorum(&env, &config);
+        if effective.decayed {
+            env.events().publish(
+                (Symbol::new(&env, "quorum_decay_applied"),),
+                QuorumDecayApplied {
+                    proposal_id,
+                    base_bps: effective.base_bps,
+                    effective_bps: effective.quorum_bps,
+                    avg_participation_bps: effective.avg_participation_bps,
+                },
+            );
+        }
+
+        let quorum_needed = total_supply
+            .checked_mul(effective.quorum_bps as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .unwrap_or(i128::MAX);
+
+        if partisan_votes == 0 {
+            // No partisan votes (For or Against) — always fails, even with high abstain turnout.
+            // An all-Abstain proposal has no clear mandate.
+            proposal.status = ProposalStatus::Failed;
+        } else if partisan_votes < quorum_needed {
+            proposal.status = ProposalStatus::Failed;
+        } else {
+            // Majority is decided by the partisan (For/Against) split only —
+            // Abstain already did its job by counting toward total participation for history
+            // and must not also dilute the For share here, otherwise a large
+            // abstaining bloc could sink a proposal that every partisan voter
+            // supported (issue #385).
+            let for_bps = if partisan_votes > 0 {
+                proposal.votes_for.checked_mul(10_000).map(|v| v / partisan_votes).unwrap_or(0)
+            } else {
+                0
+            };
+            if for_bps >= config.majority_bps as i128 {
+                proposal.status = ProposalStatus::Passed;
+                proposal.execution_time = env.ledger().timestamp() + config.proposal_timelock;
+            } else {
+                proposal.status = ProposalStatus::Failed;
+            }
+        }
+
+        // Record this vote's turnout so it feeds the next proposal's adaptive
+        // quorum. Use total_votes (including abstain) to represent actual participation.
+        Self::record_participation(&env, total_votes, total_supply);
+
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        // Refund exactly what was locked at creation — never re-read the
+        // live config, which the admin can change after the proposer
+        // deposited (issue #137).
+        gov_token.transfer(
+            &env.current_contract_address(),
+            &proposal.proposer,
+            &proposal.deposit,
+        );
+
+        let proposal_key = StorageKey::Proposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        // Issue #630: proposal is now resolved — clear its content hash so
+        // the same action can be re-proposed.
+        Self::clear_proposal_hash(&env, &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_finalized"),),
+            ProposalFinalized {
+                proposal_id,
+                status: proposal.status.clone(),
+            },
+        );
+    }
+
+    /// Finalize multiple proposals atomically in a single transaction.
+    ///
+    /// When multiple proposals end at the same ledger, calling `finalize`
+    /// individually can yield inconsistent state because each call sees a
+    /// slightly different view. This batch variant processes all proposals
+    /// in one shot: each is validated and settled sequentially, but the
+    /// entire batch either succeeds or reverts as a unit.
+    ///
+    /// Panics if any single proposal in the batch fails its finalization
+    /// checks (e.g. not Active, finalize delay not met), reverting the
+    /// whole batch. Permissionless — same rules as `finalize`.
+    pub fn finalize_batch(env: Env, proposal_ids: Vec<u64>) {
+        if proposal_ids.is_empty() {
+            panic_with_error!(&env, Error::NoProposals);
+        }
+
+        // Cap batch size to bound instruction budget.
+        const MAX_BATCH_FINALIZE: u32 = 20;
+        if proposal_ids.len() > MAX_BATCH_FINALIZE {
+            panic_with_error!(&env, Error::BatchTooLarge);
+        }
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let gov_token = token::Client::new(&env, &config.gov_token);
+
+        for i in 0..proposal_ids.len() {
+            let pid = proposal_ids.get_unchecked(i);
+            let mut proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&StorageKey::Proposal(pid))
+                .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+            if proposal.status != ProposalStatus::Active {
+                panic_with_error!(&env, Error::ProposalNotActive);
+            }
+
+            if env.ledger().timestamp() <= proposal.vote_end + FINALIZE_DELAY {
+                panic_with_error!(&env, Error::FinalizeDelayNotMet);
+            }
+
+            let total_supply = proposal.total_supply;
+            let partisan_votes = proposal.votes_for + proposal.votes_against;
+
+            let effective = Self::effective_quorum(&env, &config);
+            if effective.decayed {
+                env.events().publish(
+                    (Symbol::new(&env, "quorum_decay_applied"),),
+                    QuorumDecayApplied {
+                        proposal_id: pid,
+                        base_bps: effective.base_bps,
+                        effective_bps: effective.quorum_bps,
+                        avg_participation_bps: effective.avg_participation_bps,
+                    },
+                );
+            }
+
+            let quorum_needed = total_supply
+                .checked_mul(effective.quorum_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap_or(i128::MAX);
+
+            if partisan_votes == 0 {
+                proposal.status = ProposalStatus::Failed;
+            } else if partisan_votes < quorum_needed {
+                proposal.status = ProposalStatus::Failed;
+            } else {
+                let for_bps = if partisan_votes > 0 {
+                    proposal.votes_for.checked_mul(10_000).map(|v| v / partisan_votes).unwrap_or(0)
+                } else {
+                    0
+                };
+                if for_bps >= config.majority_bps as i128 {
+                    proposal.status = ProposalStatus::Passed;
+                    proposal.execution_time = env.ledger().timestamp() + config.proposal_timelock;
+                } else {
+                    proposal.status = ProposalStatus::Failed;
+                }
+            }
+
+            let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
+            Self::record_participation(&env, total_votes, total_supply);
+
+            gov_token.transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &proposal.deposit,
+            );
+
+            env.storage()
+                .persistent()
+                .set(&StorageKey::Proposal(pid), &proposal);
+
+            // Issue #630: clear hash so the same action can be re-proposed.
+            Self::clear_proposal_hash(&env, &proposal);
+
+            env.events().publish(
+                (Symbol::new(&env, "proposal_finalized"),),
+                ProposalFinalized {
+                    proposal_id: pid,
+                    status: proposal.status.clone(),
+                },
+            );
+        }
+    }
+
+    /// Reclaim a proposer's deposit on a proposal that was never finalized.
+    ///
+    /// `finalize()` is already permissionless and already refunds the
+    /// deposit regardless of whether quorum/majority was reached — but it
+    /// still requires *someone* to call it, and nobody is economically
+    /// incentivized to spend a transaction finalizing a proposal that
+    /// plainly failed quorum. Without this, such a deposit can sit locked
+    /// indefinitely waiting on goodwill (issue #378).
+    ///
+    /// Callable by anyone once `now > vote_end + DEPOSIT_RECLAIM_TIMEOUT` —
+    /// far past the point `finalize()` itself becomes callable — on a
+    /// proposal still `Active`. Settles the proposal as `Failed` (mirroring
+    /// what `finalize()` would compute for zero additional turnout) and
+    /// refunds the deposit to the original proposer.
+    pub fn reclaim_deposit(env: Env, proposal_id: u64) {
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        if proposal.status != ProposalStatus::Active {
+            panic_with_error!(&env, Error::ProposalNotActive);
+        }
+        if env.ledger().timestamp() <= proposal.vote_end.saturating_add(DEPOSIT_RECLAIM_TIMEOUT) {
+            panic_with_error!(&env, Error::ProposalNotExpired);
+        }
+
+        proposal.status = ProposalStatus::Failed;
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
+        Self::record_participation(&env, total_votes, proposal.total_supply);
+
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        gov_token.transfer(
+            &env.current_contract_address(),
+            &proposal.proposer,
+            &proposal.deposit,
+        );
+
+        let proposal_key = StorageKey::Proposal(proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        // Issue #630: clear hash so the same action can be re-proposed.
+        Self::clear_proposal_hash(&env, &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "deposit_reclaimed"),),
+            DepositReclaimed {
+                proposal_id,
+                proposer: proposal.proposer,
+                amount: proposal.deposit,
+            },
+        );
+    }
+
+    /// Mark a Passed proposal as Executed once its timelock has expired.
+    ///
+    /// Requires `status == Passed` and `now >= execution_time`. This
+    /// contract only flips the status flag — it does not itself perform the
+    /// cross-contract call to `target::function(args)`; the caller is
+    /// responsible for building the actual invocation and its auth tree, so
+    /// this contract never needs admin rights on the proposal's target.
+    pub fn execute(env: Env, proposal_id: u64) {
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        if proposal.status == ProposalStatus::Executed {
+            panic_with_error!(&env, Error::AlreadyExecuted);
+        }
+        if proposal.status == ProposalStatus::Cancelled {
+            panic_with_error!(&env, Error::AlreadyCancelled);
+        }
+        if proposal.status != ProposalStatus::Passed {
+            panic_with_error!(&env, Error::ProposalNotPassed);
+        }
+        // Guardian veto check: proposals vetoed by guardians cannot be executed
+        if proposal.is_vetoed {
+            panic_with_error!(&env, Error::ProposalVetoed);
+        }
+        if env.ledger().timestamp() < proposal.execution_time {
+            panic_with_error!(&env, Error::TimelockNotExpired);
+        }
+        // Check execution deadline: if passed, prevent execution to keep proposals fresh
+        if env.ledger().timestamp() > proposal.execution_deadline {
+            proposal.status = ProposalStatus::Expired;
+            env.storage()
+                .persistent()
+                .set(&StorageKey::Proposal(proposal_id), &proposal);
+            panic_with_error!(&env, Error::ExecutionDeadlineExpired);
+        }
+
+        // Validate target address is a valid Stellar address before execution
+        // This is a defense-in-depth check to prevent targeting invalid contracts
+        Self::validate_stellar_address(&env, &proposal.target);
+
+        // Perform actual cross-contract call to target::function(args)
+        // If the target contract doesn't exist or the function is invalid,
+        // this call will fail and the proposal won't be marked as executed
+        let _: Val = env.invoke_contract(&proposal.target, &proposal.function, proposal.args.clone());
+
+        proposal.status = ProposalStatus::Executed;
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal_id), &proposal);
+
+        let executed_at = env.ledger().timestamp();
+        let audit = ExecutionAuditRecord {
+            proposal_id,
+            executor: proposal.proposer.clone(),
+            target: proposal.target.clone(),
+            function: proposal.function.clone(),
+            executed_at,
+            votes_for: proposal.votes_for,
+            votes_against: proposal.votes_against,
+        };
+        let audit_key = StorageKey::ExecutionAudit(proposal_id);
+        env.storage().persistent().set(&audit_key, &audit);
+        env.storage().persistent().extend_ttl(&audit_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_executed"),),
+            ProposalExecuted {
+                proposal_id,
+                executor: proposal.proposer,
+                target: proposal.target,
+                function: proposal.function,
+                executed_at,
+            },
+        );
+    }
+
+    /// Return the execution audit trail record for an executed proposal.
+    pub fn get_execution_audit(env: Env, proposal_id: u64) -> ExecutionAuditRecord {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::ExecutionAudit(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound))
+    }
+
+    // ── On-Chain Discussion ──────────────────────────────────────────────────
+
+    /// Post a comment on a proposal during the Discussion or Active phase.
+    /// Comments are stored on-chain for transparent discussion.
+    /// `reply_to` is optional and allows threading of comments.
+    pub fn add_comment(
+        env: Env,
+        commenter: Address,
+        proposal_id: u64,
+        text: Bytes,
+        reply_to: Option<u128>,
+    ) -> u128 {
+        commenter.require_auth();
+
+        // Validate text length (max 1024 bytes)
+        if text.is_empty() || text.len() > 1024 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        // Verify proposal exists
+        let proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        // Only allow comments during Discussion or Active phases
+        if proposal.status != ProposalStatus::Discussion && proposal.status != ProposalStatus::Active {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+
+        // If reply_to is specified, verify that comment exists
+        if let Some(reply_id) = reply_to {
+            if !env
+                .storage()
+                .persistent()
+                .has(&StorageKey::ProposalComment(reply_id))
+            {
+                panic_with_error!(&env, Error::ProposalNotFound);
+            }
+        }
+
+        // Generate comment ID
+        let comment_id: u128 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::NextCommentId(proposal_id))
+            .unwrap_or(1u128);
+
+        let now = env.ledger().timestamp();
+        let comment = ProposalComment {
+            id: comment_id,
+            proposal_id,
+            author: commenter.clone(),
+            text,
+            created_at: now,
+            reply_to,
+        };
+
+        let comment_key = StorageKey::ProposalComment(comment_id);
+        env.storage().persistent().set(&comment_key, &comment);
+        env.storage()
+            .persistent()
+            .extend_ttl(&comment_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::NextCommentId(proposal_id), &(comment_id.saturating_add(1)));
+
+        env.events().publish(
+            (Symbol::new(&env, "comment_added"),),
+            ProposalCommentAdded {
+                proposal_id,
+                comment_id,
+                author: commenter,
+                reply_to,
+                created_at: now,
+            },
+        );
+
+        comment_id
+    }
+
+    /// Retrieve a comment by its ID.
+    pub fn get_comment(env: Env, comment_id: u128) -> ProposalComment {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::ProposalComment(comment_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound))
+    }
+
+    /// Admin-only: delete a comment (for moderation of spam/abuse).
+    pub fn delete_comment(env: Env, admin: Address, comment_id: u128) {
+        Self::require_admin(&env, &admin);
+
+        let comment_key = StorageKey::ProposalComment(comment_id);
+        if !env.storage().persistent().has(&comment_key) {
+            panic_with_error!(&env, Error::ProposalNotFound);
+        }
+
+        env.storage().persistent().remove(&comment_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "comment_deleted"),),
+            comment_id,
+        );
+    }
+
+    /// Admin-only: cancel an Active proposal before voting closes.
+    ///
+    /// Refunds the proposer's deposit (the exact amount locked at
+    /// proposal creation) and marks the proposal Cancelled. Voters who
+    /// already locked tokens can reclaim them via `withdraw_tokens`
+    /// once cancelled.
+    pub fn cancel(env: Env, admin: Address, proposal_id: u64) {
+        Self::require_admin(&env, &admin);
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        if proposal.status != ProposalStatus::Active && proposal.status != ProposalStatus::Discussion {
+            panic_with_error!(&env, Error::ProposalNotActive);
+        }
+
+        proposal.status = ProposalStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal_id), &proposal);
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let gov_token = token::Client::new(&env, &config.gov_token);
+        gov_token.transfer(
+            &env.current_contract_address(),
+            &proposal.proposer,
+            &proposal.deposit,
+        );
+
+        // Issue #630: clear hash so the same action can be re-proposed.
+        Self::clear_proposal_hash(&env, &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_cancelled"),),
+            ProposalCancelled { proposal_id },
+        );
+    }
+
+    /// Transition a proposal from Discussion to Active once its discussion
+    /// period has elapsed. Callable by anyone — the discussion period is a
+    /// time-based gate, not a permission gate.
+    ///
+    /// If no discussion period is configured (`discussion_period == 0`), the
+    /// proposal was created directly in Active status and this function
+    /// panics with `DiscussionPeriodNotRequired`.
+    pub fn start_voting(env: Env, proposal_id: u64) {
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        if proposal.status != ProposalStatus::Discussion {
+            panic_with_error!(&env, Error::ProposalNotActive);
+        }
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        if config.discussion_period == 0 {
+            panic_with_error!(&env, Error::DiscussionPeriodNotRequired);
+        }
+
+        // The discussion period ended when created_at + discussion_period passed.
+        let discussion_end = proposal.created_at.saturating_add(config.discussion_period);
+        if env.ledger().timestamp() < discussion_end {
+            panic_with_error!(&env, Error::DiscussionPeriodNotEnded);
+        }
+
+        proposal.status = ProposalStatus::Active;
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "discussion_period_ended"),),
+            DiscussionPeriodEnded { proposal_id },
+        );
+    }
+
+
+    // ── Adaptive quorum ───────────────────────────────────────────────────────
+
+    /// Configure adaptive quorum decay.
+    ///
+    /// Disabled by default: an existing DAO keeps its static quorum until it
+    /// deliberately opts in. `floor_bps` is clamped up to `MIN_QUORUM_BPS` —
+    /// decay can relax the requirement toward the floor but can never take it
+    /// below the level the contract considers safe at all.
+    pub fn set_quorum_decay(
+        env: Env,
+        admin: Address,
+        enabled: bool,
+        floor_bps: u32,
+        decay_per_period_bps: u32,
+        window: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        let config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        // A floor at or above the configured quorum would make decay a no-op,
+        // which is a configuration mistake worth surfacing rather than
+        // silently accepting.
+        if enabled && floor_bps >= config.quorum_bps {
+            panic_with_error!(&env, Error::InvalidQuorumDecay);
+        }
+        if enabled && (window == 0 || window > MAX_PARTICIPATION_WINDOW) {
+            panic_with_error!(&env, Error::InvalidQuorumDecay);
+        }
+        if enabled && decay_per_period_bps == 0 {
+            panic_with_error!(&env, Error::InvalidQuorumDecay);
+        }
+
+        let effective_floor = floor_bps.max(MIN_QUORUM_BPS);
+
+        let decay = QuorumDecayConfig {
+            enabled,
+            floor_bps: effective_floor,
+            decay_per_period_bps,
+            window,
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::QuorumDecay, &decay);
+
+        env.events().publish(
+            (Symbol::new(&env, "quorum_decay_updated"),),
+            QuorumDecayConfigUpdated {
+                enabled,
+                floor_bps: effective_floor,
+                decay_per_period_bps,
+                window,
+            },
+        );
+    }
+
+    /// Enable or tune time-weighted voting power (issue #515). Admin-only.
+    ///
+    /// `ramp_period` is the seconds of holding needed for full weight and
+    /// `min_bps` the share of a balance that counts from the start.
+    pub fn set_time_weight(env: Env, admin: Address, enabled: bool, ramp_period: u64, min_bps: u32) {
+        Self::require_admin(&env, &admin);
+        if enabled && (ramp_period == 0 || min_bps > FULL_WEIGHT_BPS) {
+            panic_with_error!(&env, Error::InvalidTimeWeight);
+        }
+        env.storage().instance().set(
+            &StorageKey::TimeWeight,
+            &TimeWeightConfig { enabled, ramp_period, min_bps },
+        );
+        env.events().publish(
+            (Symbol::new(&env, "time_weight_updated"),),
+            TimeWeightConfigUpdated { enabled, ramp_period, min_bps },
+        );
+    }
+
+    /// The current time-weighted voting settings.
+    pub fn get_time_weight(env: Env) -> TimeWeightConfig {
+        Self::time_weight_config(&env)
+    }
+
+    /// Record the caller's current balance as held from now, starting (or
+    /// continuing) the ramp toward full voting weight.
+    ///
+    /// A balance at or below the recorded amount keeps its original start
+    /// time and lowers the recorded amount. A larger balance restarts the
+    /// clock, so tokens bought just before a vote cannot borrow the age of
+    /// tokens held earlier.
+    pub fn checkpoint_voting_power(env: Env, holder: Address) {
+        holder.require_auth();
+        let config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        let balance = token::Client::new(&env, &config.gov_token).balance(&holder);
+        let key = StorageKey::WeightCheckpoint(holder);
+        let now = env.ledger().timestamp();
+        let cp = match env.storage().persistent().get::<_, WeightCheckpoint>(&key) {
+            Some(prev) if balance <= prev.amount => WeightCheckpoint { amount: balance, since: prev.since },
+            _ => WeightCheckpoint { amount: balance, since: now },
+        };
+        env.storage().persistent().set(&key, &cp);
+    }
+
+    /// The current adaptive-quorum settings.
+    pub fn get_quorum_decay(env: Env) -> QuorumDecayConfig {
+        Self::quorum_decay_config(&env)
+    }
+
+    /// Configure impact-based proposal threshold escalation (issue #438).
+    ///
+    /// Every multiplier must fall in `[MIN_MULTIPLIER_BPS, MAX_MULTIPLIER_BPS]`
+    /// (i.e. between 1x and 10x). Values below `MIN_MULTIPLIER_BPS` would let
+    /// this feature *lower* the deposit gate below the configured base, which
+    /// defeats the point; values above `MAX_MULTIPLIER_BPS` risk demanding
+    /// more tokens than exist in circulation and bricking proposal creation.
+    ///
+    /// Admin-only. Emits `ImpactMultipliersUpdated`.
+    pub fn set_impact_multipliers(
+        env: Env,
+        admin: Address,
+        standard_bps: u32,
+        upgrade_bps: u32,
+        self_target_bps: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        for m in [standard_bps, upgrade_bps, self_target_bps].iter() {
+            if *m < MIN_MULTIPLIER_BPS || *m > MAX_MULTIPLIER_BPS {
+                panic_with_error!(&env, Error::InvalidImpactMultiplier);
+            }
+        }
+
+        let multipliers = ImpactMultipliers {
+            standard_bps,
+            upgrade_bps,
+            self_target_bps,
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::ImpactMultipliers, &multipliers);
+
+        env.events().publish(
+            (Symbol::new(&env, "impact_multipliers_updated"),),
+            ImpactMultipliersUpdated {
+                standard_bps,
+                upgrade_bps,
+                self_target_bps,
+            },
+        );
+    }
+
+    /// The impact-based multipliers currently in effect. Returns the
+    /// historical 1x-across-the-board default when no admin has configured
+    /// them (issue #438).
+    pub fn get_impact_multipliers(env: Env) -> ImpactMultipliers {
+        Self::impact_multipliers(&env)
+    }
+
+    /// The gov-token deposit a proposal of the given `kind` and `target`
+    /// would require right now, after impact-based escalation (issue #438).
+    /// Callers can read this before invoking `create_proposal` /
+    /// `propose_upgrade` so they know exactly what will be locked.
+    pub fn get_effective_threshold(env: Env, kind: ProposalKind, target: Address) -> i128 {
+        Self::effective_threshold(&env, &kind, &target)
+    }
+
+    /// Rolling participation history used to compute adaptive quorum.
+    pub fn get_participation_history(env: Env) -> ParticipationHistory {
+        Self::participation_history(&env)
+    }
+
+    /// The quorum that would be applied to a proposal finalized right now,
+    /// and the participation figure behind it.
+    ///
+    /// Exposed so voters can see the bar before they vote rather than
+    /// discovering it at finalize.
+    pub fn get_effective_quorum(env: Env) -> EffectiveQuorum {
+        let config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        Self::effective_quorum(&env, &config)
+    }
+
+    // ── Proposal templates ────────────────────────────────────────────────────
+
+    /// Admin-only: register (or update) a named proposal template.
+    ///
+    /// A template is a minimal structural contract for a common proposal
+    /// type: a minimum title length and an exact expected argument count.
+    /// `create_proposal_from_template` rejects proposals that don't match,
+    /// so reviewers no longer have to parse intent out of free-form,
+    /// inconsistent proposals for the categories a DAO cares to standardize
+    /// (issue #381).
+    pub fn register_template(
+        env: Env,
+        admin: Address,
+        name: Symbol,
+        description: Bytes,
+        min_title_len: u32,
+        required_arg_count: u32,
+    ) {
+        Self::require_admin(&env, &admin);
+
+        let template = ProposalTemplate {
+            name: name.clone(),
+            description,
+            min_title_len,
+            required_arg_count,
+            active: true,
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::Template(name.clone()), &template);
+
+        let mut names: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TemplateList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut already_present = false;
+        for n in names.iter() {
+            if n == name {
+                already_present = true;
+                break;
+            }
+        }
+        if !already_present {
+            names.push_back(name.clone());
+            env.storage().instance().set(&StorageKey::TemplateList, &names);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "template_registered"),),
+            TemplateRegistered {
+                name,
+                min_title_len,
+                required_arg_count,
+            },
+        );
+    }
+
+    /// Admin-only: deactivate a template so it can no longer be used for new
+    /// proposals. Proposals already created from it are unaffected.
+    pub fn deactivate_template(env: Env, admin: Address, name: Symbol) {
+        Self::require_admin(&env, &admin);
+        let key = StorageKey::Template(name.clone());
+        let mut template: ProposalTemplate = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::TemplateNotFound));
+        template.active = false;
+        env.storage().instance().set(&key, &template);
+    }
+
+    /// Fetch a registered template by name.
+    pub fn get_template(env: Env, name: Symbol) -> ProposalTemplate {
+        env.storage()
+            .instance()
+            .get(&StorageKey::Template(name))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::TemplateNotFound))
+    }
+
+    /// List the names of all registered templates (active or not).
+    pub fn list_templates(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::TemplateList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Create a proposal, validated against a registered template's
+    /// structure before creation: `title` must be at least
+    /// `template.min_title_len` bytes and `args` must have exactly
+    /// `template.required_arg_count` entries. Otherwise behaves exactly
+    /// like `create_proposal` (same deposit/threshold/lifecycle).
+    pub fn create_proposal_from_template(
+        env: Env,
+        proposer: Address,
+        template_name: Symbol,
+        title: Bytes,
+        target: Address,
+        function: Symbol,
+        args: Vec<Val>,
+        impact_analysis: Bytes,
+    ) -> u64 {
+        let template: ProposalTemplate = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Template(template_name.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::TemplateNotFound));
+        if !template.active {
+            panic_with_error!(&env, Error::TemplateInactive);
+        }
+        if title.len() < template.min_title_len {
+            panic_with_error!(&env, Error::TitleTooShort);
+        }
+        if args.len() != template.required_arg_count {
+            panic_with_error!(&env, Error::ArgCountMismatch);
+        }
+
+        let proposal_id = Self::create_proposal(env.clone(), proposer, title, target, function, args, impact_analysis);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_created_from_template"),),
+            ProposalCreatedFromTemplate {
+                proposal_id,
+                template_name,
+            },
+        );
+
+        proposal_id
+    }
+
+    // ── Queries ───────────────────────────────────────────────────────────────
+
+    /// Fetch a proposal by id. Panics with `ProposalNotFound` if it doesn't exist.
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound))
+    }
+
+    /// Look up a voter's vote record (choice + weight) for a proposal, if
+    /// they voted. Returns `None` if the address has not voted.
+    pub fn get_vote(env: Env, proposal_id: u64, voter: Address) -> Option<VoteRecord> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::VoteRecord(proposal_id, voter))
+    }
+
+    /// Return the current DAO configuration (gov token, thresholds, periods).
+    pub fn get_config(env: Env) -> DaoConfig {
+        env.storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
+    }
+
+    /// Return the current admin address.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
+    }
+
+    /// Admin-only: set the risk pool contract address. When set, the
+    /// `vote()` function queries the risk pool for any LP share delegation
+    /// the voter may have, adding delegated LP shares to their voting
+    /// weight on top of their gov-token balance.
+    pub fn set_risk_pool(env: Env, admin: Address, risk_pool: Address) {
+        Self::require_admin(&env, &admin);
+        Self::validate_stellar_address(&env, &risk_pool);
+        env.storage().instance().set(&StorageKey::RiskPool, &risk_pool);
+        env.events().publish(
+            (Symbol::new(&env, "risk_pool_set"),),
+            risk_pool,
+        );
+    }
+
+    /// Return the configured risk pool contract address, if any.
+    pub fn get_risk_pool(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::RiskPool)
+    }
+
+    /// Return the total number of proposals ever created (next proposal id).
+    pub fn proposal_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::NextProposalId)
+            .unwrap_or(0)
+    }
+
+    /// Return the contract's current storage/version number (defaults to 1).
+    pub fn get_version(env: Env) -> u32 {
+        env.storage().instance().get(&StorageKey::Version).unwrap_or(1)
+    }
+
+    // ── Admin ─────────────────────────────────────────────────────────────────
+
+    /// Admin-only: replace the DAO configuration wholesale.
+    ///
+    /// Only affects proposals created after this call — `finalize()` always
+    /// uses the `deposit` and `total_supply` snapshotted on each `Proposal`
+    /// at creation time, so changing `proposal_threshold` or `total_supply`
+    /// here cannot retroactively affect proposals already in flight.
+    pub fn update_config(env: Env, admin: Address, config: DaoConfig) {
+        Self::require_admin(&env, &admin);
+        if config.voting_period < MIN_VOTING_PERIOD {
+            panic_with_error!(&env, Error::VotingPeriodTooShort);
+        }
+        if config.voting_period > MAX_VOTING_PERIOD {
+            panic_with_error!(&env, Error::VotingPeriodTooLong);
+        }
+        if config.quorum_bps < MIN_QUORUM_BPS {
+            panic_with_error!(&env, Error::QuorumTooLow);
+        }
+        if config.quorum_bps > MAX_QUORUM_BPS {
+            panic_with_error!(&env, Error::QuorumTooHigh);
+        }
+        env.storage().instance().set(&StorageKey::Config, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "dao_config_updated"),),
+            DaoConfigUpdated {
+                gov_token: config.gov_token.clone(),
+                proposal_threshold: config.proposal_threshold,
+                total_supply: config.total_supply,
+                voting_period: config.voting_period,
+                proposal_timelock: config.proposal_timelock,
+            },
+        );
+    }
+
+    /// Admin-only: change the minimum governance-token balance needed to create
+    /// a proposal, without replacing the rest of the DAO configuration
+    /// (issue #551). Like `update_config`, it only affects proposals created
+    /// after this call; in-flight proposals keep the deposit snapshotted at
+    /// creation. The threshold must be positive.
+    pub fn set_proposal_threshold(env: Env, admin: Address, new_threshold: i128) {
+        Self::require_admin(&env, &admin);
+        if new_threshold <= 0 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        let mut config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        config.proposal_threshold = new_threshold;
+        env.storage().instance().set(&StorageKey::Config, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "dao_config_updated"),),
+            DaoConfigUpdated {
+                gov_token: config.gov_token.clone(),
+                proposal_threshold: config.proposal_threshold,
+                total_supply: config.total_supply,
+                voting_period: config.voting_period,
+                proposal_timelock: config.proposal_timelock,
+            },
+        );
+    }
+
+    /// Upgrade the contract WASM in-place. Only the admin may call this.
+    /// Storage is preserved across upgrades; only the execution code changes.
+    /// Runs storage migrations if the new version requires them.
+    ///
+    /// If a guardian threshold > 0 is configured (`set_guardians`), this call
+    /// does not upgrade immediately — it registers the upgrade as pending and
+    /// requires `threshold` guardians to call `approve_upgrade` before the
+    /// WASM is actually replaced, guarding this irreversible operation
+    /// against a single compromised admin key.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>, new_version: u32) {
+        Self::require_admin(&env, &admin);
+        let current_version: u32 = env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
+        if new_version <= current_version {
+            panic_with_error!(&env, Error::VersionNotNewer);
+        }
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+        if threshold == 0 {
+            Self::run_migrations(&env, current_version, new_version);
+            env.storage().instance().set(&StorageKey::Version, &new_version);
+            env.deployer().update_current_contract_wasm(new_wasm_hash);
+
+            env.events().publish(
+                (Symbol::new(&env, "contract_upgraded"),),
+                ContractUpgraded {
+                    old_version: current_version,
+                    new_version,
+                },
+            );
+            return;
+        }
+
+        let pending = PendingUpgrade {
+            new_wasm_hash,
+            new_version,
+            approvals: Vec::new(&env),
+        };
+        env.storage().instance().set(&StorageKey::PendingUpgrade, &pending);
+    }
+
+    /// Configure the guardian set and approval threshold required for
+    /// critical actions (currently: contract upgrades). Admin-only.
+    /// `threshold` must be at least 1 and at most `guardians.len()`. Setting
+    /// threshold to 0 is rejected to prevent disabling multisig security (issue #523).
+    pub fn set_guardians(env: Env, admin: Address, guardians: Vec<Address>, threshold: u32) {
+        Self::require_admin(&env, &admin);
+        for i in 0..guardians.len() {
+            for j in (i + 1)..guardians.len() {
+                if guardians.get(i).unwrap() == guardians.get(j).unwrap() {
+                    panic_with_error!(&env, Error::InvalidInput);
+                }
+            }
+        }
+        if threshold == 0 || threshold > guardians.len() {
+            panic_with_error!(&env, Error::InvalidThreshold);
+        }
+        env.storage().instance().set(&StorageKey::Guardians, &guardians);
+        env.storage()
+            .instance()
+            .set(&StorageKey::GuardianThreshold, &threshold);
+        env.events().publish(
+            (Symbol::new(&env, "guardians_updated"),),
+            GuardiansUpdated { guardians, threshold },
+        );
+    }
+
+    /// Return the current guardian set.
+    pub fn get_guardians(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return the current guardian approval threshold (0 = disabled).
+    pub fn get_guardian_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0)
+    }
+
+    /// Return the pending upgrade awaiting guardian approvals, if any.
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().instance().get(&StorageKey::PendingUpgrade)
+    }
+
+    /// Guardian approval for the pending upgrade. Once enough guardians have
+    /// approved (>= threshold), the upgrade executes immediately.
+    pub fn approve_upgrade(env: Env, guardian: Address, new_wasm_hash: BytesN<32>) {
+        guardian.require_auth();
+
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_guardian = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        let mut pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingUpgrade)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingUpgrade));
+        if pending.new_wasm_hash != new_wasm_hash {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+        for a in pending.approvals.iter() {
+            if a == guardian {
+                panic_with_error!(&env, Error::AlreadyApprovedAction);
+            }
+        }
+        pending.approvals.push_back(guardian.clone());
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_approved"),),
+            UpgradeApproved {
+                new_wasm_hash: new_wasm_hash.clone(),
+                approver: guardian,
+                approvals: pending.approvals.len(),
+                threshold,
+            },
+        );
+
+        if pending.approvals.len() >= threshold {
+            let current_version: u32 =
+                env.storage().instance().get(&StorageKey::Version).unwrap_or(1);
+            env.storage().instance().remove(&StorageKey::PendingUpgrade);
+            Self::run_migrations(&env, current_version, pending.new_version);
+            env.storage()
+                .instance()
+                .set(&StorageKey::Version, &pending.new_version);
+            env.deployer().update_current_contract_wasm(new_wasm_hash);
+
+            env.events().publish(
+                (Symbol::new(&env, "contract_upgraded"),),
+                ContractUpgraded {
+                    old_version: current_version,
+                    new_version: pending.new_version,
+                },
+            );
+        } else {
+            env.storage().instance().set(&StorageKey::PendingUpgrade, &pending);
+        }
+    }
+
+    /// Admin-only: cancel a pending upgrade before it collects enough
+    /// guardian approvals.
+    pub fn cancel_pending_upgrade(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        if !env.storage().instance().has(&StorageKey::PendingUpgrade) {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+        env.storage().instance().remove(&StorageKey::PendingUpgrade);
+    }
+
+    /// Guardian veto for a security-critical proposal.
+    /// Only guardians can veto. Once vetoed, a proposal cannot be executed,
+    /// even if it passes voting and the timelock expires.
+    /// Use this to halt potentially malicious proposals before execution.
+    pub fn veto_proposal(env: Env, guardian: Address, proposal_id: u64, reason: Symbol) {
+        guardian.require_auth();
+
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        let mut is_guardian = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Proposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+        // Can only veto before execution
+        if proposal.status == ProposalStatus::Executed {
+            panic_with_error!(&env, Error::AlreadyExecuted);
+        }
+
+        if proposal.is_vetoed {
+            panic_with_error!(&env, Error::ProposalVetoed);
+        }
+
+        proposal.is_vetoed = true;
+        env.storage()
+            .persistent()
+            .set(&StorageKey::Proposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_vetoed"),),
+            ProposalVetoed {
+                proposal_id,
+                guardian,
+                reason,
+            },
+        );
+    }
+
+    /// Run storage migrations from old_version to new_version.
+    /// Each migration function handles a specific version transition.
+    fn run_migrations(_env: &Env, _old_version: u32, _new_version: u32) {
+        // Migration from v1 to v2: No storage changes needed yet
+        // This is where you would add migration logic for specific version bumps
+        // Example: if old_version < 2 && new_version >= 2 { Self::migrate_v1_to_v2(env); }
+        
+        // Future migrations follow the pattern:
+        // if old_version < 3 && new_version >= 3 { Self::migrate_v2_to_v3(env); }
+    }
+
+    /// Query the risk pool for any LP share delegation the voter may have.
+    /// Returns the delegated LP share count, or 0 if no risk pool is
+    /// configured or the voter has no delegation.
+    fn get_delegated_lp_weight(env: &Env, voter: &Address) -> i128 {
+        let risk_pool_addr: Address = match env.storage().instance().get(&StorageKey::RiskPool) {
+            Some(addr) => addr,
+            None => return 0,
+        };
+        RiskPoolClient::new(env, &risk_pool_addr)
+            .get_delegated_shares(voter)
+    }
+
+
+    /// Impact-based escalation multipliers, or the historical 1x default
+    /// (issue #438). The default is chosen so a DAO that predates this
+    /// feature has exactly the same weight/deposit gate as before.
+    fn impact_multipliers(env: &Env) -> ImpactMultipliers {
+        env.storage()
+            .instance()
+            .get(&StorageKey::ImpactMultipliers)
+            .unwrap_or(ImpactMultipliers {
+                standard_bps: MIN_MULTIPLIER_BPS,
+                upgrade_bps: MIN_MULTIPLIER_BPS,
+                self_target_bps: MIN_MULTIPLIER_BPS,
+            })
+    }
+
+    /// The proposal_threshold effectively required for a proposal of the
+    /// given `kind` and `target`, in gov-token units. Base
+    /// `config.proposal_threshold` scaled by the applicable multiplier
+    /// (issue #438).
+    ///
+    /// Selection: `Upgrade` -> `upgrade_bps`; `Standard` with target == this
+    /// contract -> `self_target_bps`; otherwise `standard_bps`. Multiplication
+    /// uses saturating i128 arithmetic — an admin who configures a
+    /// pathological base + multiplier gets `i128::MAX` (bricks proposal
+    /// creation), which surfaces the misconfiguration rather than silently
+    /// wrapping.
+    fn effective_threshold(env: &Env, kind: &ProposalKind, target: &Address) -> i128 {
+        let config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+
+        let mult = Self::impact_multipliers(env);
+        let mult_bps: i128 = match kind {
+            ProposalKind::Upgrade => mult.upgrade_bps as i128,
+            ProposalKind::Standard => {
+                if target == &env.current_contract_address() {
+                    mult.self_target_bps as i128
+                } else {
+                    mult.standard_bps as i128
+                }
+            }
+        };
+
+        config
+            .proposal_threshold
+            .saturating_mul(mult_bps)
+            .saturating_div(MIN_MULTIPLIER_BPS as i128)
+    }
+
+    fn time_weight_config(env: &Env) -> TimeWeightConfig {
+        env.storage()
+            .instance()
+            .get(&StorageKey::TimeWeight)
+            .unwrap_or(TimeWeightConfig { enabled: false, ramp_period: 0, min_bps: FULL_WEIGHT_BPS })
+    }
+
+    /// Voting weight for `balance` held by `holder`. Identity when time
+    /// weighting is off. Otherwise the checkpointed part of the balance ramps
+    /// from `min_bps` to full over `ramp_period`, and anything above the
+    /// checkpoint counts at `min_bps`.
+    fn time_weighted(env: &Env, holder: &Address, balance: i128) -> i128 {
+        let cfg = Self::time_weight_config(env);
+        if !cfg.enabled || balance <= 0 {
+            return balance;
+        }
+        let full = FULL_WEIGHT_BPS as i128;
+        let min = cfg.min_bps as i128;
+        let now = env.ledger().timestamp();
+        let (aged, since) = match env
+            .storage()
+            .persistent()
+            .get::<_, WeightCheckpoint>(&StorageKey::WeightCheckpoint(holder.clone()))
+        {
+            Some(cp) => (core::cmp::min(cp.amount, balance), cp.since),
+            None => (0, now),
+        };
+        let elapsed = core::cmp::min(now.saturating_sub(since), cfg.ramp_period) as i128;
+        let factor = min + (full - min) * elapsed / cfg.ramp_period as i128;
+        aged.saturating_mul(factor) / full + (balance - aged).saturating_mul(min) / full
+    }
+
+    /// Adaptive-quorum settings, or the disabled default.
+    fn quorum_decay_config(env: &Env) -> QuorumDecayConfig {
+        env.storage()
+            .instance()
+            .get(&StorageKey::QuorumDecay)
+            .unwrap_or(QuorumDecayConfig {
+                enabled: false,
+                floor_bps: MIN_QUORUM_BPS,
+                decay_per_period_bps: 0,
+                window: 0,
+            })
+    }
+
+    /// Rolling participation history, or an empty one.
+    fn participation_history(env: &Env) -> ParticipationHistory {
+        env.storage()
+            .instance()
+            .get(&StorageKey::Participation)
+            .unwrap_or(ParticipationHistory {
+                recent_bps: Vec::new(env),
+                total_recorded: 0,
+            })
+    }
+
+    /// Average turnout across the recorded window, in basis points.
+    /// Returns `None` when there is no history to average.
+    fn average_participation_bps(history: &ParticipationHistory) -> Option<u32> {
+        let len = history.recent_bps.len();
+        if len == 0 {
+            return None;
+        }
+
+        let mut sum: u64 = 0;
+        for i in 0..len {
+            sum += history.recent_bps.get_unchecked(i) as u64;
+        }
+        Some((sum / len as u64) as u32)
+    }
+
+    /// The quorum requirement in force, after any decay.
+    ///
+    /// Decay is proportional to the shortfall: the further average turnout has
+    /// fallen below the configured requirement, the more the requirement
+    /// relaxes — bounded by `floor_bps`, which itself can never sit below
+    /// `MIN_QUORUM_BPS`.
+    ///
+    /// With no history at all, the base requirement stands. A DAO's very first
+    /// proposals should not get a discount for the absence of evidence.
+    fn effective_quorum(env: &Env, config: &DaoConfig) -> EffectiveQuorum {
+        let base_bps = config.quorum_bps;
+        let decay = Self::quorum_decay_config(env);
+        let history = Self::participation_history(env);
+        let avg = Self::average_participation_bps(&history);
+
+        let avg_bps = avg.unwrap_or(0);
+
+        // SECURITY FIX: When participation history is empty (no recent proposals),
+        // fall back to base quorum. This prevents division by zero and ensures
+        // the DAO works correctly before any proposals have been finalized.
+        if !decay.enabled || avg.is_none() {
+            return EffectiveQuorum {
+                quorum_bps: base_bps,
+                base_bps,
+                avg_participation_bps: avg_bps,
+                decayed: false,
+            };
+        }
+
+        // Participation at or above the bar is not a low-participation period,
+        // so nothing decays.
+        if avg_bps >= base_bps {
+            return EffectiveQuorum {
+                quorum_bps: base_bps,
+                base_bps,
+                avg_participation_bps: avg_bps,
+                decayed: false,
+            };
+        }
+
+        // How many whole decay steps the shortfall represents. Each
+        // `decay_per_period_bps` of shortfall relaxes the bar by the same
+        // amount, so the requirement tracks observed turnout rather than
+        // collapsing to the floor at the first quiet vote.
+        let shortfall = base_bps - avg_bps;
+        let steps = shortfall / decay.decay_per_period_bps.max(1);
+        let reduction = steps.saturating_mul(decay.decay_per_period_bps);
+
+        let decayed_bps = base_bps.saturating_sub(reduction).max(decay.floor_bps);
+
+        EffectiveQuorum {
+            quorum_bps: decayed_bps,
+            base_bps,
+            avg_participation_bps: avg_bps,
+            decayed: decayed_bps < base_bps,
+        }
+    }
+
+    /// Record a finalized proposal's turnout into the rolling window.
+    ///
+    /// Turnout is measured against the supply snapshotted at proposal
+    /// creation, matching how quorum itself is measured, so the two figures
+    /// are always comparable.
+    fn record_participation(env: &Env, total_votes: i128, total_supply: i128) {
+        let decay = Self::quorum_decay_config(env);
+        let window = if decay.window == 0 {
+            DEFAULT_PARTICIPATION_WINDOW
+        } else {
+            decay.window
+        };
+
+        let turnout_bps: u32 = if total_supply <= 0 {
+            0
+        } else {
+            total_votes
+                .checked_mul(10_000)
+                .map(|v| v / total_supply)
+                .unwrap_or(10_000)
+                .clamp(0, 10_000) as u32
+        };
+
+        let mut history = Self::participation_history(env);
+        history.recent_bps.push_back(turnout_bps);
+        while history.recent_bps.len() > window {
+            history.recent_bps.pop_front();
+        }
+        history.total_recorded = history.total_recorded.saturating_add(1);
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::Participation, &history);
+    }
+
+    /// Remove `delegator` from `delegate`'s delegator list.
+    fn remove_delegator(env: &Env, delegate: &Address, delegator: &Address) {
+        let delegators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Delegators(delegate.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut remaining: Vec<Address> = Vec::new(env);
+        for i in 0..delegators.len() {
+            let entry = delegators.get_unchecked(i);
+            if entry != *delegator {
+                remaining.push_back(entry);
+            }
+        }
+
+        if remaining.is_empty() {
+            env.storage()
+                .persistent()
+                .remove(&StorageKey::Delegators(delegate.clone()));
+        } else {
+            env.storage()
+                .persistent()
+                .set(&StorageKey::Delegators(delegate.clone()), &remaining);
+        }
+    }
+
+    /// Sum the live balances delegated to `voter` and mark each delegator as
+    /// counted for this proposal.
+    ///
+    /// Balances are read now rather than at delegation time, so weight follows
+    /// the tokens: a delegator who has sold since delegating lends nothing.
+    fn collect_delegated_weight(
+        env: &Env,
+        voter: &Address,
+        proposal_id: u64,
+        gov_token: &token::Client,
+    ) -> i128 {
+        let delegators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&StorageKey::Delegators(voter.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut total: i128 = 0;
+        for i in 0..delegators.len() {
+            let delegator = delegators.get_unchecked(i);
+            let balance = gov_token.balance(&delegator);
+            if balance <= 0 {
+                continue;
+            }
+
+            let marker = StorageKey::DelegatedVote(proposal_id, delegator.clone());
+            if env.storage().persistent().has(&marker) {
+                continue;
+            }
+            env.storage().persistent().set(&marker, &true);
+
+            let counted = Self::time_weighted(env, &delegator, balance);
+            total = total.saturating_add(counted);
+
+            // Track delegation usage for off-chain indexing
+            env.events().publish(
+                (Symbol::new(env, "delegation_used"),),
+                DelegationUsed {
+                    proposal_id,
+                    delegate: voter.clone(),
+                    delegator,
+                    weight: counted,
+                },
+            );
+        }
+
+        total
+    }
+
+    /// Compute a content hash over `(target, function, args)` that uniquely
+    /// identifies the on-chain action a proposal would perform. Used to detect
+    /// duplicate proposals (issue #630). SHA-256 is available through the
+    /// Soroban host and produces a 32-byte `BytesN<32>`.
+    fn proposal_content_hash(
+        env: &Env,
+        target: &Address,
+        function: &Symbol,
+        args: &Vec<Val>,
+    ) -> BytesN<32> {
+        let mut preimage = soroban_sdk::Bytes::new(env);
+        // Append the target address bytes.
+        let target_str = target.to_string();
+        let mut target_buf = [0u8; 56];
+        target_str.copy_into_slice(&mut target_buf);
+        preimage.extend_from_array(&target_buf);
+        // Append the function symbol bytes (up to 9 chars encoded as Soroban's u64).
+        let fn_val: u64 = function.to_val().get_payload();
+        preimage.extend_from_array(&fn_val.to_be_bytes());
+        // Append each arg's raw XDR payload so identical argument lists hash identically.
+        for i in 0..args.len() {
+            let v: Val = args.get_unchecked(i);
+            let payload: u64 = v.get_payload();
+            preimage.extend_from_array(&payload.to_be_bytes());
+        }
+        env.crypto().sha256(&preimage).into()
+    }
+
+    /// Remove the active-proposal hash entry for `proposal`, if present.
+    /// Called whenever a proposal leaves Active/Discussion so the same action
+    /// can be re-proposed later (issue #630).
+    fn clear_proposal_hash(env: &Env, proposal: &Proposal) {
+        let hash = Self::proposal_content_hash(
+            env,
+            &proposal.target,
+            &proposal.function,
+            &proposal.args,
+        );
+        let key = StorageKey::ActiveProposalHash(hash);
+        if env.storage().instance().has(&key) {
+            env.storage().instance().remove(&key);
+        }
+    }
+
+    fn require_admin(env: &Env, caller: &Address) {        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *caller != admin {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        caller.require_auth();
+    }
+
+    /// Validate that an address has a valid Stellar format (56-char, starts with G or C).
+    fn validate_stellar_address(env: &Env, address: &Address) {
+        let addr_str = address.to_string();
+        if addr_str.len() != 56 {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
+        let mut buf = [0u8; 56];
+        addr_str.copy_into_slice(&mut buf);
+        if buf[0] != b'G' && buf[0] != b'C' {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
+    }
+
+    /// Extend the TTL for proposal-related storage entries to prevent expiry
+    /// during voting, timelock, and execution periods.
+    fn extend_proposal_ttl(env: &Env, key: &StorageKey, _config: &DaoConfig) {
+        env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+}
+
+#[cfg(test)]
+mod test;
+#[cfg(test)]
+mod test_advanced;

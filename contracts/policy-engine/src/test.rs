@@ -2006,3 +2006,42 @@ fn test_buy_policy_incorrect_token() {
     
     w.pe.buy_policy(&w.buyer, &product_id, &100_000_000, &30, &symbol_short!("kis2606"), &wrong_token);
 }
+
+#[test]
+fn oracle_change_requires_guardian_approval_and_timelock() {
+    let (env, admin, old_oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let guardian = Address::generate(&env);
+    let new_oracle = env.register(PolicyEngine, ());
+
+    client.set_oracle_guardian(&admin, &guardian);
+    client.propose_oracle_change(&admin, &new_oracle);
+    assert_eq!(client.get_oracle(), old_oracle);
+
+    client.approve_oracle_change(&guardian);
+    assert!(client.try_execute_oracle_change(&admin).is_err());
+
+    env.ledger().with_mut(|ledger| {
+        ledger.timestamp += ORACLE_CHANGE_TIMELOCK_SECONDS;
+    });
+    client.execute_oracle_change(&admin);
+
+    assert_eq!(client.get_oracle(), new_oracle);
+    assert_eq!(client.get_pending_oracle_change(), None);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #44)")]
+fn oracle_change_cannot_execute_without_guardian_approval() {
+    let (env, admin, _old_oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let guardian = Address::generate(&env);
+    let new_oracle = env.register(PolicyEngine, ());
+
+    client.set_oracle_guardian(&admin, &guardian);
+    client.propose_oracle_change(&admin, &new_oracle);
+    env.ledger().with_mut(|ledger| {
+        ledger.timestamp += ORACLE_CHANGE_TIMELOCK_SECONDS;
+    });
+    client.execute_oracle_change(&admin);
+}

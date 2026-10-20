@@ -1731,11 +1731,11 @@ fn test_per_category_escalation_threshold() {
     let threshold = 3600; // 1 hour
 
     // Default is none
-    assert_eq!(cp.get_category_escalation_threshold(&crop), None);
+    assert_eq!(cp.get_category_escalation(&crop), None);
 
     // Set category threshold
-    cp.set_category_escalation_threshold(&w.admin, &crop, &threshold);
-    assert_eq!(cp.get_category_escalation_threshold(&crop), Some(threshold));
+    cp.set_category_escalation(&w.admin, &crop, &threshold);
+    assert_eq!(cp.get_category_escalation(&crop), Some(threshold));
 }
 
 // ── Guardian threshold validation (#608) ─────────────────────────────────────
@@ -1785,6 +1785,24 @@ fn set_guardians_rejects_threshold_exceeding_guardian_count() {
     let guardians = Vec::from_array(&w.env, [g]);
 
     cp.set_guardians(&w.admin, &guardians, &2u32);
+}
+
+#[test]
+fn dispute_window_defaults_to_seven_days_and_accepts_valid_updates() {
+    let w = deploy();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    assert_eq!(cp.get_dispute_window(), DEFAULT_DISPUTE_WINDOW);
+
+    cp.set_dispute_window(&w.admin, &MIN_DISPUTE_WINDOW);
+    assert_eq!(cp.get_dispute_window(), MIN_DISPUTE_WINDOW);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #35)")]
+fn dispute_window_cannot_be_zero() {
+    let w = deploy();
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .set_dispute_window(&w.admin, &0u64);
 }
 
 /// Issue #645: `schedule_installments` must reject a zero or negative

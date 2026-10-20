@@ -142,6 +142,16 @@ pub struct ClaimsProcessorUpdated {
     pub claims_processor: Address,
 }
 
+/// A two-party, time-delayed oracle rotation. The admin proposes and executes;
+/// the independent guardian approves during the review period.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingOracleChange {
+    pub new_oracle: Address,
+    pub execute_after: u64,
+    pub guardian_approved: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProductCreated {

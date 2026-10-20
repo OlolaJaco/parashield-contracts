@@ -830,3 +830,18 @@ fn transfer_position_between_non_admins_still_works() {
     assert!(pool.get_position(&lp1).is_some());
     assert!(pool.get_position(&admin).is_none());
 }
+
+/// LP NFT IDs occupy the range 1..u64::MAX. Once the counter reaches the
+/// final value minting must fail instead of wrapping to zero and colliding.
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn lp_nft_id_exhaustion_fails_with_overflow() {
+    let (env, pool, _usdc_id, _admin, _treasury, lp1) = setup();
+    env.as_contract(&pool.address, || {
+        env.storage()
+            .instance()
+            .set(&StorageKey::NextNftId, &u64::MAX);
+    });
+
+    pool.deposit(&lp1, &1000_0000000i128, &0i128, &false);
+}

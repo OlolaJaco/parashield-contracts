@@ -1061,6 +1061,17 @@ fn delegation_chains_are_refused() {
     dao.delegate(&voter1, &voter2);
 }
 
+/// Delegation is a directed graph. Adding B→A after A→B would close a cycle,
+/// so it receives the dedicated circular-delegation error before any state is
+/// changed.
+#[test]
+#[should_panic(expected = "Error(Contract, #51)")]
+fn circular_delegation_is_refused() {
+    let (_env, dao, _admin, voter1, voter2, _target) = setup();
+    dao.delegate(&voter1, &voter2);
+    dao.delegate(&voter2, &voter1);
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #26)")]
 fn a_delegate_cannot_themselves_delegate() {
