@@ -1681,6 +1681,9 @@ impl GovernanceDao {
         if enabled && floor_bps >= config.quorum_bps {
             panic_with_error!(&env, Error::InvalidQuorumDecay);
         }
+        if enabled && (floor_bps < MIN_QUORUM_BPS || floor_bps > MAX_QUORUM_BPS) {
+            panic_with_error!(&env, Error::QuorumTooLow);
+        }
         if enabled && (window == 0 || window > MAX_PARTICIPATION_WINDOW) {
             panic_with_error!(&env, Error::InvalidQuorumDecay);
         }

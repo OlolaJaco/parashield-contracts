@@ -254,6 +254,8 @@ pub enum Error {
     NoStakeWithdrawalRequest = 34,
     /// Stake withdrawal has already been requested (#681).
     WithdrawalAlreadyRequested = 35,
+    /// Oracle reputation score is out of bounds (0-1000 bps) (issue #749).
+    InvalidReputation = 36,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -1943,6 +1945,9 @@ impl OracleVerifier {
     /// Admin-only.
     pub fn set_stale_reputation_penalty(env: Env, admin: Address, reputation_lost: u32) {
         Self::require_admin(&env, &admin);
+        if reputation_lost > 1_000 {
+            panic_with_error!(&env, Error::InvalidReputation);
+        }
         env.storage()
             .instance()
             .set(&StorageKey::StaleReputationPenalty, &reputation_lost);
@@ -1950,6 +1955,27 @@ impl OracleVerifier {
             (Symbol::new(&env, "stale_reputation_penalty_updated"),),
             StaleReputationPenaltyUpdated { reputation_lost },
         );
+    }
+
+    /// Admin-only: explicitly set or override an oracle's reputation score (0..=1000 bps) (issue #749).
+    pub fn set_reputation(env: Env, admin: Address, oracle: Address, data_type: Symbol, score: u32) {
+        Self::require_admin(&env, &admin);
+        if score > 1_000 {
+            panic_with_error!(&env, Error::InvalidReputation);
+        }
+        let key = StorageKey::Reputation(data_type.clone(), oracle.clone());
+        let mut rep: OracleReputation = env.storage().persistent().get(&key).unwrap_or(OracleReputation {
+            oracle: oracle.clone(),
+            data_type: data_type.clone(),
+            total_submissions: 0,
+            accurate_submissions: 0,
+            score: 500,
+            last_updated: 0,
+        });
+        rep.score = score;
+        rep.last_updated = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &rep);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     /// Currently configured reputation basis-point penalty (`0` if unset).

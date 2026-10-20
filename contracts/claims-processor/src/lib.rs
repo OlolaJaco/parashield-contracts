@@ -210,6 +210,8 @@ pub enum Error {
     InvalidDisputeWindow = 35,
     /// The configured opportunity to dispute this decision has elapsed.
     DisputeWindowExpired = 36,
+    /// Payout token does not match policy token (issue #751).
+    InvalidToken = 38,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -1994,6 +1996,27 @@ impl ClaimsProcessor {
             .instance()
             .get(&StorageKey::PayoutDelay)
             .unwrap_or(0)
+    }
+
+    /// Claim the payout for an approved claim, verifying that the payout token matches the policy token (issue #751).
+    pub fn claim_payout_with_token(env: Env, claim_id: u128, payout_token: Address) -> i128 {
+        Self::require_not_paused(&env);
+        let claim: Claim = env.storage().persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+
+        let policy_engine: Address = env.storage().instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        let policy = PolicyEngineClient::new(&env, &policy_engine).get_policy(&claim.policy_id);
+        let product = PolicyEngineClient::new(&env, &policy_engine).get_product(&policy.product_id);
+
+        if payout_token != product.expected_token {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
+
+        Self::claim_payout(env, claim_id)
     }
 
     /// Claim the payout for an approved claim after the payout delay has elapsed.
