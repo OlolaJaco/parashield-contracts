@@ -37,6 +37,8 @@ use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
 /// cannot overflow i128.
 #[allow(dead_code)]
 const MAX_ORACLES: u32 = 100;
+/// Maximum number of registered oracles per key or data type (issue #727).
+pub const MAX_ORACLES_PER_KEY: u32 = 10;
 /// Maximum number of data points stored per (data_type, key).
 const MAX_DATA_POINTS: u32 = 100;
 
@@ -339,11 +341,10 @@ impl OracleVerifier {
             .get(&StorageKey::OracleList(data_type.clone()))
             .unwrap_or_else(|| Vec::new(&env));
         
-        // Count how many oracles are already registered for this data_type
-        // If close to max, require admin to review (this is a simplified check).
-        // In a more sophisticated system, you'd track controller pubkeys.
+        // Count how many oracles are already registered for this data_type / key (issue #727).
+        // Limit to MAX_ORACLES_PER_KEY to prevent Sybil attacks and oracle domination.
         let oracle_count = list.len();
-        if oracle_count >= MAX_ORACLES {
+        if oracle_count >= MAX_ORACLES_PER_KEY {
             panic_with_error!(&env, Error::TooManyOracles);
         }
         

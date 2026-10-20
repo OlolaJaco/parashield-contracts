@@ -2067,6 +2067,45 @@ impl ClaimsProcessor {
         Self::claim_deadline(&env)
     }
 
+    /// Submit evidence files for a claim, rejecting zero hashes and enforcing max file count (issue #728, #747).
+    pub fn submit_claim_evidence(env: Env, claim_id: u128, claimant: Address, evidence_hashes: Vec<Bytes>) {
+        Self::require_not_paused(&env);
+        claimant.require_auth();
+        let claim: Claim = env.storage().persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+        if claim.claimant != claimant {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if evidence_hashes.len() > MAX_EVIDENCE_FILES {
+            panic_with_error!(&env, Error::EvidenceLimitExceeded);
+        }
+        for i in 0..evidence_hashes.len() {
+            let hash = evidence_hashes.get_unchecked(i);
+            if hash.is_empty() {
+                panic_with_error!(&env, Error::InvalidEvidence);
+            }
+            let mut all_zeros = true;
+            for b in hash.iter() {
+                if b != 0 {
+                    all_zeros = false;
+                    break;
+                }
+            }
+            if all_zeros {
+                panic_with_error!(&env, Error::InvalidEvidence);
+            }
+        }
+        let key = StorageKey::ClaimEvidence(claim_id);
+        env.storage().persistent().set(&key, &evidence_hashes);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Retrieve attached evidence hashes for a claim if available (issue #728, #747).
+    pub fn get_claim_evidence(env: Env, claim_id: u128) -> Vec<Bytes> {
+        env.storage().persistent().get(&StorageKey::ClaimEvidence(claim_id)).unwrap_or_else(|| Vec::new(&env))
+    }
+
     // ── Payout Delay (issue #432) ─────────────────────────────────────────────
 
     /// Set the delay in seconds between claim approval and actual payout.

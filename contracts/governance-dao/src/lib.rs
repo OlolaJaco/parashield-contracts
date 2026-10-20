@@ -126,6 +126,8 @@ enum StorageKey {
     Participation,
     /// Who an address has delegated its voting power to — Address → Address.
     DelegateOf(Address),
+    /// Expiration timestamp of a vote delegation — Address -> u64 (issue #726).
+    DelegationExpiry(Address),
     /// Addresses currently delegating to an account — Address → Vec<Address>.
     Delegators(Address),
     /// Marks that a delegator's weight was already counted in a proposal, so
@@ -675,6 +677,12 @@ impl GovernanceDao {
             .persistent()
             .set(&StorageKey::Delegators(delegate.clone()), &delegators);
 
+        // Set delegation expiry (default 180 days) (issue #726)
+        let expiry = env.ledger().timestamp().saturating_add(180 * 24 * 60 * 60);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::DelegationExpiry(delegator.clone()), &expiry);
+
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
         let weight = token::Client::new(&env, &config.gov_token).balance(&delegator);
 
@@ -699,6 +707,28 @@ impl GovernanceDao {
         );
     }
 
+    /// Delegate voting power with an explicit expiration duration in seconds (issue #726).
+    pub fn delegate_with_expiry(env: Env, delegator: Address, delegate: Address, duration_seconds: u64) {
+        if duration_seconds == 0 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        Self::delegate(env.clone(), delegator.clone(), delegate);
+        let expiry = env.ledger().timestamp().saturating_add(duration_seconds);
+        env.storage()
+            .persistent()
+            .set(&StorageKey::DelegationExpiry(delegator), &expiry);
+    }
+
+    /// Check if a delegation is expired (issue #726).
+    pub fn is_delegation_expired(env: Env, delegator: Address) -> bool {
+        let now = env.ledger().timestamp();
+        if let Some(expiry) = env.storage().persistent().get::<_, u64>(&StorageKey::DelegationExpiry(delegator)) {
+            now > expiry
+        } else {
+            false
+        }
+    }
+
     /// Withdraw a delegation, returning voting authority to the delegator.
     ///
     /// Effective immediately for any proposal the delegate has not already
@@ -717,6 +747,9 @@ impl GovernanceDao {
         env.storage()
             .persistent()
             .remove(&StorageKey::DelegateOf(delegator.clone()));
+        env.storage()
+            .persistent()
+            .remove(&StorageKey::DelegationExpiry(delegator.clone()));
         Self::remove_delegator(&env, &delegate, &delegator);
 
         env.events().publish(
@@ -739,8 +772,11 @@ impl GovernanceDao {
         );
     }
 
-    /// Who this address has delegated to, if anyone.
+    /// Who this address has delegated to, if anyone (respects expiration).
     pub fn get_delegate(env: Env, delegator: Address) -> Option<Address> {
+        if Self::is_delegation_expired(env.clone(), delegator.clone()) {
+            return None;
+        }
         env.storage()
             .persistent()
             .get(&StorageKey::DelegateOf(delegator))
