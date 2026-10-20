@@ -836,6 +836,27 @@ impl PolicyEngine {
         Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, start_time, &payment_token)
     }
 
+    /// Buy an insurance policy asserting that the premium rate matches product bounds (issue #741).
+    pub fn buy_policy_with_rate(
+        env: Env,
+        buyer: Address,
+        product_id: u128,
+        coverage_amount: i128,
+        duration_days: u32,
+        oracle_key: Symbol,
+        payment_token: Address,
+        rate_bps: u32,
+    ) -> u128 {
+        buyer.require_auth();
+        Self::ensure_not_paused(&env);
+        let product: InsuranceProduct = Self::load_product(&env, product_id);
+        if rate_bps != product.premium_rate_bps || rate_bps == 0 || rate_bps > 5_000 {
+            panic_with_error!(&env, Error::InvalidPremiumRate);
+        }
+        let now = env.ledger().timestamp();
+        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, now, &payment_token)
+    }
+
     /// Buy multiple policies in a single atomic transaction.
     ///
     /// Up to `MAX_BATCH_BUY` policies may be purchased at once. If any single
@@ -955,6 +976,11 @@ impl PolicyEngine {
 
         if coverage_amount > 1_000_000_000_000 {
             panic_with_error!(env, Error::CoverageOutOfRange);
+        }
+
+        // SECURITY FIX (issue #741): Validate product premium rate is within valid configured bounds (1..=5_000 bps)
+        if product.premium_rate_bps == 0 || product.premium_rate_bps > 5_000 {
+            panic_with_error!(env, Error::InvalidPremiumRate);
         }
         
         // SECURITY FIX: Calculate the required premium based on product parameters.
