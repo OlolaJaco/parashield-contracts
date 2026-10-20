@@ -379,6 +379,24 @@ impl RiskPool {
     /// capacity change lands on their own deposit. The separation costs
     /// nothing here — the pool already requires third-party liquidity to
     /// function — so the conflict is refused outright rather than bounded.
+    /// Deposit liquidity specifying the deposit token address, verifying it matches the pool's token (issue #738).
+    pub fn deposit_with_token(
+        env: Env,
+        provider: Address,
+        deposit_token: Address,
+        amount: i128,
+        min_shares: i128,
+        compound_enabled: bool,
+    ) -> i128 {
+        let usdc: Address = env.storage().instance()
+            .get(&StorageKey::UsdcToken)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if deposit_token != usdc {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
+        Self::deposit(env, provider, amount, min_shares, compound_enabled)
+    }
+
     pub fn deposit(
         env: Env,
         provider: Address,

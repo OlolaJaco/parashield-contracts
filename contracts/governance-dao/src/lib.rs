@@ -226,6 +226,8 @@ pub enum Error {
     CircularDelegation = 51,
     /// A proposal template with this name already exists (issue #746).
     DuplicateTemplateName = 52,
+    /// Vote weight must be strictly positive (> 0) (issue #739).
+    ZeroVoteWeight = 53,
 }
 
 #[contract]
@@ -835,10 +837,10 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::WeightAlreadyCounted);
         }
 
-        // 1. Capture voting balance weight
+        // 1. Capture voting balance weight - strictly positive weight required (issue #739)
         let own_weight = gov_token.balance(&voter);
         if own_weight <= 0 {
-            panic_with_error!(&env, Error::InsufficientWeight);
+            panic_with_error!(&env, Error::ZeroVoteWeight);
         }
 
         // Apply vote weight cap to prevent whale dominance (issue #431).
@@ -854,7 +856,7 @@ impl GovernanceDao {
         let delegated_weight = Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
         let weight = own_tally_weight.saturating_add(delegated_weight);
         if weight <= 0 {
-            panic_with_error!(&env, Error::InsufficientWeight);
+            panic_with_error!(&env, Error::ZeroVoteWeight);
         }
 
         // 3. Lock tokens in the DAO contract to prevent token cycling / double-voting
@@ -981,7 +983,7 @@ impl GovernanceDao {
         let gov_token = token::Client::new(&env, &config.gov_token);
         let own_weight = gov_token.balance(&voter);
         if own_weight <= 0 {
-            panic_with_error!(&env, Error::InsufficientWeight);
+            panic_with_error!(&env, Error::ZeroVoteWeight);
         }
 
         // Apply vote weight cap to prevent whale dominance (issue #431).
@@ -1000,6 +1002,9 @@ impl GovernanceDao {
             let delegated_weight =
                 Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
             let weight = own_tally_weight.saturating_add(delegated_weight);
+            if weight <= 0 {
+                panic_with_error!(&env, Error::ZeroVoteWeight);
+            }
 
             match choice {
                 VoteChoice::For => proposal.votes_for += weight,
