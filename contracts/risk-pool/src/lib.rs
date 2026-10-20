@@ -282,6 +282,7 @@ impl RiskPool {
         // Address validation is deferred to require_auth() calls which
         // verify the address on the Soroban network layer.
         
+        Self::require_not_zero_address(&env, &admin);
         let admin_str = admin.to_string();
 
         if admin_str.len() != 56 {
@@ -2158,6 +2159,11 @@ impl RiskPool {
         }
 
         // Apply the parameter change
+        if pending.new_lp_bps < 0 || pending.new_treas_bps < 0 || pending.new_backstop_bps < 0
+            || pending.new_lp_bps + pending.new_treas_bps + pending.new_backstop_bps != 10_000
+        {
+            panic_with_error!(&env, Error::InvalidSplit);
+        }
         let split = PremiumSplit {
             lp_bps: pending.new_lp_bps,
             treas_bps: pending.new_treas_bps,
@@ -2503,6 +2509,7 @@ impl RiskPool {
     pub fn propose_new_admin(env: Env, admin: Address, new_admin: Address) {
         Self::require_admin(&env, &admin);
         Self::validate_stellar_address(&env, &new_admin);
+        Self::require_not_zero_address(&env, &new_admin);
 
         // Issue #457: reject a fresh proposal while one is already pending —
         // the armed transfer must complete (be accepted) before another can
@@ -2609,6 +2616,7 @@ impl RiskPool {
             panic_with_error!(&env, Error::Unauthorized);
         }
         admin.require_auth();
+        Self::require_not_zero_address(&env, &admin);
         let since: u64 = env.storage().instance()
             .get(&StorageKey::PendingAdminSince).unwrap_or(0);
         if env.ledger().timestamp() < since.saturating_add(ADMIN_TRANSFER_TIMELOCK) {
