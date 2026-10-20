@@ -797,6 +797,14 @@ impl RiskPool {
     /// Transfer `shares` from `from` address to `to` address.
     /// Returns the proportional USDC deposit amount transferred.
     ///
+    /// Transfer LP shares between providers, validating amount is strictly positive (issue #717).
+    pub fn transfer_shares(env: Env, from: Address, to: Address, shares: i128) -> i128 {
+        if shares <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+        Self::transfer_position(env, from, to, shares)
+    }
+
     /// The admin cannot be the receiving side either (issue #568) —
     /// otherwise `transfer_position` is a one-transaction way around the
     /// `deposit` restriction and the separation of duties it exists for.

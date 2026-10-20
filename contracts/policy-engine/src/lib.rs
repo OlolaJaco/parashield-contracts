@@ -991,6 +991,11 @@ impl PolicyEngine {
             .and_then(|v| v.checked_div(365))
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
+
+        // SECURITY FIX (issue #719): Reject zero or negative premium amounts to prevent free coverage
+        if required_premium <= 0 {
+            panic_with_error!(env, Error::ZeroPremiumRate);
+        }
         
         // SECURITY FIX: reject payment if token does not match the product's expected token
         if payment_token != &product.expected_token {

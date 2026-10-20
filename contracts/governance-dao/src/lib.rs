@@ -1401,6 +1401,9 @@ impl GovernanceDao {
         if proposal.status == ProposalStatus::Cancelled {
             panic_with_error!(&env, Error::AlreadyCancelled);
         }
+        if proposal.status == ProposalStatus::Expired {
+            panic_with_error!(&env, Error::ExecutionDeadlineExpired);
+        }
         if proposal.status != ProposalStatus::Passed {
             panic_with_error!(&env, Error::ProposalNotPassed);
         }
@@ -1458,6 +1461,11 @@ impl GovernanceDao {
                 executed_at,
             },
         );
+    }
+
+    /// Execute proposal alias (issue #720), checking deadline and expiration.
+    pub fn execute_proposal(env: Env, proposal_id: u64) {
+        Self::execute(env, proposal_id);
     }
 
     /// Return the execution audit trail record for an executed proposal.
