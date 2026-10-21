@@ -360,6 +360,17 @@ pub struct PendingAdminChange {
     pub approvals: Vec<Address>,
 }
 
+/// A pending guardian-removal proposal (issue #774). Removing a guardian
+/// is a privileged action: the admin proposes with `propose_remove_guardian`
+/// and the remaining guardians must gather `threshold-many` approvals via
+/// `approve_remove_guardian` before the removal is applied.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingGuardianRemoval {
+    pub guardian_to_remove: Address,
+    pub approvals: Vec<Address>,
+}
+
 /// A time-locked change to the premium-split ratios, awaiting execution once
 /// `executable_after` has passed. LPs can exit during the timelock window.
 #[contracttype]

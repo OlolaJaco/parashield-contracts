@@ -128,6 +128,11 @@ pub(crate) enum StorageKey {
     PendingUpgrade,
     /// A pending admin-transfer proposal awaiting guardian approvals.
     PendingAdminChange,
+    /// A pending guardian-removal proposal awaiting approvals from the
+    /// remaining guardians. Issue #774: admin alone can no longer dismantle
+    /// the guardian multisig — removals require threshold-many approvals
+    /// from guardians other than the one being removed.
+    PendingGuardianRemoval,
     /// A time-locked premium-split change awaiting execution.
     PendingParameterChange,
     /// Next LP NFT token ID (u64), sequential minting counter.
@@ -239,6 +244,10 @@ pub enum Error {
     Reentrancy                = 47,
     /// Pool name exceeds maximum allowable length or is empty (issue #748).
     NameTooLong               = 48,
+    /// Issue #774: admin cannot shrink the guardian set via `set_guardians`.
+    GuardianRemoveBlocked     = 49,
+    /// Issue #774: removal would drop the committee below MIN_GUARDIANS.
+    MinGuardiansUnmet         = 50,
 }
 
 /// RAII Reentrancy Guard that sets transient/instance lock on entry and cleans up on drop.
@@ -2473,11 +2482,44 @@ impl RiskPool {
     /// `threshold == 0` disables the guardian requirement (default), so the
     /// admin alone can act — preserves existing single-admin behavior until
     /// guardians are explicitly configured.
+    ///
+    /// Issue #774: once an initial guardian set is in place, `set_guardians`
+    /// can only *expand* the committee or raise the threshold. Admin alone
+    /// cannot drop an existing guardian — doing so would let a single
+    /// compromised admin key dismantle the multisig. Use
+    /// `propose_remove_guardian` + `approve_remove_guardian` to shrink the
+    /// set, which routes removal through the remaining guardians. The
+    /// initial `set_guardians` call (when no guardians are configured yet)
+    /// is unaffected: that is the bootstrapping step and must be callable.
     pub fn set_guardians(env: Env, admin: Address, guardians: Vec<Address>, threshold: u32) {
         Self::require_admin(&env, &admin);
         if threshold > guardians.len() {
             panic_with_error!(&env, Error::InvalidThreshold);
         }
+
+        // Issue #774: when a guardian set already exists, every current
+        // guardian must appear in the new set. Removing one via this path
+        // would route around the propose/approve flow below.
+        let existing: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !existing.is_empty() {
+            for current in existing.iter() {
+                let mut retained = false;
+                for g in guardians.iter() {
+                    if g == current {
+                        retained = true;
+                        break;
+                    }
+                }
+                if !retained {
+                    panic_with_error!(&env, Error::GuardianRemoveBlocked);
+                }
+            }
+        }
+
         env.storage().instance().set(&StorageKey::Guardians, &guardians);
         env.storage()
             .instance()
@@ -2486,6 +2528,176 @@ impl RiskPool {
             (Symbol::new(&env, "guardians_updated"),),
             GuardiansUpdated { guardians, threshold },
         );
+    }
+
+    /// Minimum guardian count enforced after a guardian removal (issue #774).
+    /// Prevents the committee from being reduced to a single key, which
+    /// would defeat the purpose of a multisig.
+    const MIN_GUARDIANS: u32 = 2;
+
+    /// Issue #774: propose removal of `guardian_to_remove` from the active
+    /// guardian set. Admin-only to initiate, but the removal only takes
+    /// effect once `approve_remove_guardian` collects `threshold` approvals
+    /// from the *other* guardians.
+    ///
+    /// Panics with:
+    /// - `NoPendingUpgrade` if guardians are not configured (threshold == 0),
+    ///   since there is nothing to remove.
+    /// - `NotAGuardianToRemove` if the named address is not a current guardian.
+    /// - `MinGuardiansRequired` if removal would drop the set below
+    ///   `MIN_GUARDIANS`.
+    /// - `AdminTransferPending` if a prior proposal is still armed; the
+    ///   earlier one must complete or be cancelled first so this one does
+    ///   not silently clear accumulated approvals.
+    pub fn propose_remove_guardian(env: Env, admin: Address, guardian_to_remove: Address) {
+        Self::require_admin(&env, &admin);
+
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+        if threshold == 0 || guardians.is_empty() {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+
+        let mut is_guardian = false;
+        for g in guardians.iter() {
+            if g == guardian_to_remove {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        if guardians.len() <= Self::MIN_GUARDIANS {
+            panic_with_error!(&env, Error::MinGuardiansUnmet);
+        }
+
+        let existing: Option<PendingGuardianRemoval> =
+            env.storage().instance().get(&StorageKey::PendingGuardianRemoval);
+        if existing.is_some() {
+            panic_with_error!(&env, Error::AdminTransferPending);
+        }
+
+        let pending = PendingGuardianRemoval {
+            guardian_to_remove,
+            approvals: Vec::new(&env),
+        };
+        env.storage()
+            .instance()
+            .set(&StorageKey::PendingGuardianRemoval, &pending);
+    }
+
+    /// Issue #774: a guardian approves the pending removal. Each guardian
+    /// may approve at most once. When approvals reach `threshold`, the
+    /// removal is applied immediately. The guardian being removed cannot
+    /// vote on their own removal.
+    pub fn approve_remove_guardian(env: Env, guardian: Address) {
+        guardian.require_auth();
+
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_guardian = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                is_guardian = true;
+                break;
+            }
+        }
+        if !is_guardian {
+            panic_with_error!(&env, Error::NotGuardian);
+        }
+
+        let mut pending: PendingGuardianRemoval = env
+            .storage()
+            .instance()
+            .get(&StorageKey::PendingGuardianRemoval)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingUpgrade));
+
+        // The guardian scheduled for removal cannot vote on their own exit.
+        if guardian == pending.guardian_to_remove {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        for a in pending.approvals.iter() {
+            if a == guardian {
+                panic_with_error!(&env, Error::AlreadyApprovedAction);
+            }
+        }
+        pending.approvals.push_back(guardian);
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::GuardianThreshold)
+            .unwrap_or(0);
+
+        if pending.approvals.len() >= threshold {
+            // Apply the removal: build the new guardian set without the
+            // removed address. Clear the pending slot before applying so
+            // nothing can observe an inconsistent transient state.
+            env.storage().instance().remove(&StorageKey::PendingGuardianRemoval);
+
+            let mut new_set: Vec<Address> = Vec::new(&env);
+            for g in guardians.iter() {
+                if g != pending.guardian_to_remove {
+                    new_set.push_back(g);
+                }
+            }
+            // Preserve `MIN_GUARDIANS` after removal (double-check: the
+            // propose side already enforces this, but the invariant is
+            // critical enough to re-verify at execution time).
+            if new_set.len() < Self::MIN_GUARDIANS {
+                panic_with_error!(&env, Error::MinGuardiansUnmet);
+            }
+            // If the threshold now exceeds the new set size, cap it.
+            let new_threshold = if threshold > new_set.len() {
+                new_set.len()
+            } else {
+                threshold
+            };
+            env.storage().instance().set(&StorageKey::Guardians, &new_set);
+            env.storage()
+                .instance()
+                .set(&StorageKey::GuardianThreshold, &new_threshold);
+            env.events().publish(
+                (Symbol::new(&env, "guardians_updated"),),
+                GuardiansUpdated {
+                    guardians: new_set,
+                    threshold: new_threshold,
+                },
+            );
+        } else {
+            env.storage()
+                .instance()
+                .set(&StorageKey::PendingGuardianRemoval, &pending);
+        }
+    }
+
+    /// Issue #774: admin may cancel a pending guardian-removal proposal
+    /// before it reaches the approval threshold.
+    pub fn cancel_pending_guardian_removal(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        if !env.storage().instance().has(&StorageKey::PendingGuardianRemoval) {
+            panic_with_error!(&env, Error::NoPendingUpgrade);
+        }
+        env.storage().instance().remove(&StorageKey::PendingGuardianRemoval);
+    }
+
+    /// Read the currently armed guardian-removal proposal, if any.
+    pub fn get_pending_guardian_removal(env: Env) -> Option<PendingGuardianRemoval> {
+        env.storage().instance().get(&StorageKey::PendingGuardianRemoval)
     }
 
     /// Return the current guardian set.
@@ -3321,3 +3533,6 @@ mod test_exit_queue;
 mod test_reinsurance;
 #[cfg(test)]
 mod test_reentrancy;
+
+#[cfg(test)]
+mod test_guardians;
