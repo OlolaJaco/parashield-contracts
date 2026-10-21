@@ -1913,6 +1913,18 @@ impl GovernanceDao {
         Self::participation_history(&env)
     }
 
+    /// Cap participation history and evict old entries to prevent unbounded storage growth (#690).
+    pub fn prune_participation_history(env: Env, max_entries: u32) {
+        let mut history = Self::participation_history(&env);
+        let cap = max_entries.min(MAX_PARTICIPATION_WINDOW);
+        while history.recent_bps.len() > cap {
+            history.recent_bps.pop_front();
+        }
+        env.storage()
+            .instance()
+            .set(&StorageKey::Participation, &history);
+    }
+
     /// The quorum that would be applied to a proposal finalized right now,
     /// and the participation figure behind it.
     ///
