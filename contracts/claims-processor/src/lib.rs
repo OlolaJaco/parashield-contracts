@@ -1367,6 +1367,24 @@ impl ClaimsProcessor {
         );
     }
 
+    /// Explicitly reject a claim and emit a claim_rejected event with reason code (#695).
+    pub fn reject_claim(env: Env, admin: Address, claim_id: u128, reason: Symbol) {
+        Self::require_admin(&env, &admin);
+        let mut claim: Claim = env.storage().persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+        claim.status = ClaimStatus::Rejected;
+        let claim_key = StorageKey::Claim(claim_id);
+        env.storage().persistent().set(&claim_key, &claim);
+        Self::extend_claim_ttl(&env, &claim_key);
+        Self::remove_from_pending(&env, claim_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "claim_rejected"),),
+            (claim_id, claim.policy_id, reason),
+        );
+    }
+
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /// Return the `Claim` record for the given `claim_id`. Panics with `ClaimNotFound` if it does not exist.
