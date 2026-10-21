@@ -1725,13 +1725,16 @@ impl RiskPool {
         env.storage().persistent().get(&StorageKey::LpPosition(provider))
     }
 
-    /// Return the pool utilisation rate in basis points (locked / deposited × 10,000).
+    /// Return the pool utilisation rate in basis points ((locked + queued_exits) / deposited × 10,000).
+    /// Includes committed exit queue shares in utilization calculation (#693).
     /// Returns 0 if no USDC has been deposited.
     pub fn get_utilization_rate(env: Env) -> u32 {
         let deposited: i128 = env.storage().instance().get(&StorageKey::TotalDeposited).unwrap_or(0);
         let locked: i128    = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
+        let queued_exits: i128 = env.storage().instance().get(&StorageKey::QueuedExitShares).unwrap_or(0);
         if deposited == 0 { return 0; }
-        let util_bps = locked.checked_mul(10_000)
+        let effective_locked = locked.saturating_add(queued_exits);
+        let util_bps = effective_locked.checked_mul(10_000)
             .and_then(|v| v.checked_div(deposited))
             .unwrap_or(0);
         // Saturate to u32::MAX if the result exceeds u32 range

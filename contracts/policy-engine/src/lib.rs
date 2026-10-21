@@ -1607,6 +1607,13 @@ impl PolicyEngine {
             .set(&StorageKey::PendingAdminSince, &env.ledger().timestamp());
     }
 
+    /// Cancel a pending admin transfer during the timelock window (#692).
+    pub fn cancel_admin_transfer(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().remove(&StorageKey::PendingAdmin);
+        env.storage().instance().remove(&StorageKey::PendingAdminSince);
+    }
+
     /// Accept the proposed admin. Only the proposed admin can call this, and
     /// only once `ADMIN_TRANSFER_TIMELOCK` has elapsed since the transfer was
     /// proposed (issue #356).

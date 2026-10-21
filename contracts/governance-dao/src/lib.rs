@@ -1964,6 +1964,11 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::EmptyDescription);
         }
 
+        // Validate template payload structure (#694)
+        if min_title_len == 0 || min_title_len > 256 || required_arg_count > 64 {
+            panic_with_error!(&env, Error::InvalidParameter);
+        }
+
         if env.storage().instance().has(&StorageKey::Template(name.clone())) {
             panic_with_error!(&env, Error::DuplicateTemplateName);
         }
