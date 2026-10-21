@@ -2604,6 +2604,11 @@ impl OracleVerifier {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Resolve conflicting oracle readings for the same key using consensus/median (#689).
+    pub fn resolve_conflicting_readings(env: Env, data_type: Symbol, key: Symbol) -> i128 {
+        Self::get_median_value(&env, &data_type, &key)
+    }
+
     // ── Verification ─────────────────────────────────────────────────────────
 
     /// Evaluate whether the aggregated oracle value satisfies a trigger condition.

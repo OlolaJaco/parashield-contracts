@@ -2366,6 +2366,14 @@ impl ClaimsProcessor {
         );
     }
 
+    /// Retrieve original claim context preserved during escalation (#691).
+    pub fn get_escalated_claim_context(env: Env, claim_id: u128) -> Claim {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound))
+    }
+
     /// Claim IDs that are Pending and past the escalation threshold.
     ///
     /// Lets a monitoring job find stuck claims in one call rather than probing

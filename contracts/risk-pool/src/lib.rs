@@ -1791,6 +1791,10 @@ impl RiskPool {
         if base_fee_bps > 10000 || max_fee_bps > 10000 || min_fee_bps > 10000 {
             panic_with_error!(&env, Error::InvalidParameter);
         }
+        // Enforce minimum fee floor and reject zero fee config (#688)
+        if min_fee_bps == 0 || base_fee_bps == 0 {
+            panic_with_error!(&env, Error::InvalidParameter);
+        }
         if min_fee_bps > base_fee_bps || base_fee_bps > max_fee_bps {
             panic_with_error!(&env, Error::InvalidParameter);
         }
