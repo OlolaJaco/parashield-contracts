@@ -152,6 +152,8 @@ enum StorageKey {
     UserLastClaim(Address),
     /// Registered valid claim type (Symbol) -> bool (issue #734).
     RegisteredClaimType(Symbol),
+    /// Evidence attachments for a claim: claim_id (u128) -> Vec<Bytes> hashes (issue #747).
+    ClaimEvidence(u128),
 }
 
 /// Maximum number of evidence files allowed per claim (issue #747).
@@ -229,6 +231,12 @@ pub enum Error {
     InvalidDisputeDeadline = 38,
     /// Claim type must be registered and non-empty (issue #734).
     InvalidClaimType = 39,
+    /// Evidence array exceeds `MAX_EVIDENCE_FILES` (issue #747).
+    EvidenceLimitExceeded = 40,
+    /// A supplied evidence hash is malformed or empty (issue #747).
+    InvalidEvidence = 41,
+    /// Payment token does not match the product's expected token.
+    InvalidToken = 42,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -724,6 +732,17 @@ impl ClaimsProcessor {
     /// `partial_payout_bps` is an optional payout ratio in basis points (0-10000).
     /// - `None` or `Some(10000)` → full coverage payment (default behavior).
     /// - `Some(bps)` where bps < 10000 → proportional partial payment, e.g. `Some(5000)` pays 50%.
+    ///
+    /// Boundary semantics (issue #776). The CoverageMismatch guard below
+    /// uses `!=` rather than `>`/`<`, so a claim whose `coverage_amount`
+    /// equals the policy's `coverage_amount` exactly is permitted — the
+    /// equality case is the common case, not a rejection branch. The
+    /// downstream payout logic in `evaluate_and_settle` mirrors this:
+    /// `paid_amount > claim.coverage_amount` (strict), so a payout exactly
+    /// at the coverage ceiling is accepted and only a payout *above* it is
+    /// rejected. The same `>` strictness applies to the installment
+    /// schedule check (`total_amount > claim.coverage_amount`). An
+    /// equal-to-ceiling value is always a valid claim, never a defect.
     pub fn process_claim(
         env: Env,
         keeper: Address,

@@ -122,6 +122,11 @@ enum StorageKey {
     /// Timestamp (u64) of an oracle's last accepted submission for a
     /// data_type — (data_type, oracle) → last submission time
     LastSubmission(Symbol, Address),
+    /// Monotonic guard: the latest reading-timestamp (u64) this oracle has
+    /// published for a specific (data_type, key) stream. Any subsequent
+    /// `submit_data` must carry a strictly greater `timestamp` or a stale
+    /// reading could silently overwrite a fresher one (issue #775).
+    LastReadingTimestamp(Symbol, Symbol, Address),
     /// Token used for oracle stake deposits (Address). Unset = staking disabled.
     StakeToken,
     /// Minimum stake (i128) an oracle must hold for a data_type before
@@ -260,6 +265,11 @@ pub enum Error {
     WithdrawalAlreadyRequested = 35,
     /// Oracle reputation score is out of bounds (0-1000 bps) (issue #749).
     InvalidReputation = 36,
+    /// A submission arrived with a timestamp older than or equal to the most
+    /// recent reading this oracle already published for the same (data_type,
+    /// key) tuple. Readings for a single stream must advance monotonically or
+    /// a stale reading can overwrite a fresher one (issue #775).
+    StaleReadingTimestamp = 37,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -2382,6 +2392,15 @@ impl OracleVerifier {
 
         Self::enforce_rate_limit(&env, &data_type, &oracle, now);
 
+        // Issue #775: monotonic reading-timestamp per (data_type, key, oracle).
+        // Readings for one stream from one oracle must advance strictly
+        // forward; otherwise a replayed or out-of-order submission from an
+        // honest-but-flaky feed can overwrite a fresher reading already
+        // folded into the aggregate. This check is intentionally scoped per
+        // oracle so one oracle's lagged clock does not block submissions
+        // from the others on the same key.
+        Self::require_strictly_newer_reading(&env, &data_type, &key, &oracle, timestamp);
+
         // Issue #459: stale-submission gate. If the submitted timestamp is
         // older than this data_type's `effective_max_age`, fold the point
         // into the stale-penalty pipeline and return without adding it to
@@ -2402,6 +2421,7 @@ impl OracleVerifier {
             timestamp,
         };
         Self::store_plain_reading(&env, &data_type, &key, new_point, now, max_data_age);
+        Self::record_reading_timestamp(&env, &data_type, &key, &oracle, timestamp);
 
         // Check cross-validation rules after storing new data
         Self::check_cross_validation(&env, &data_type, &key);
@@ -3138,6 +3158,11 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::InvalidTimestamp);
             }
 
+            // Issue #775: monotonic reading-timestamp per (data_type, key,
+            // oracle). Same guard as submit_data — batch callers must not
+            // bypass it.
+            Self::require_strictly_newer_reading(&env, &data_type, &key, &oracle, timestamp);
+
             let max_data_age = Self::effective_max_age(&env, &data_type);
             if now.saturating_sub(timestamp) > max_data_age {
             Self::handle_stale_submission(&env, &oracle, &data_type, timestamp, max_data_age);
@@ -3150,6 +3175,7 @@ impl OracleVerifier {
             timestamp,
             };
             Self::store_plain_reading(&env, &data_type, &key, new_point, now, max_data_age);
+            Self::record_reading_timestamp(&env, &data_type, &key, &oracle, timestamp);
 
             env.events().publish(
                 (Symbol::new(&env, "oracle_data_submitted"),),
@@ -3226,6 +3252,16 @@ impl OracleVerifier {
             if sub.timestamp < now.saturating_sub(max_timestamp_age) {
                 panic_with_error!(&env, Error::InvalidTimestamp);
             }
+            // Issue #775: monotonic reading-timestamp per (data_type, key,
+            // oracle). Same guard as submit_data — batch callers must not
+            // bypass it.
+            Self::require_strictly_newer_reading(
+                &env,
+                &data_type,
+                &sub.key,
+                &oracle,
+                sub.timestamp,
+            );
             // Issue #459: per-item stale-submission gate. A stale item in a
             // batch is skipped (with penalty accounting) rather than failing
             // the whole batch, so a partial-good batch still lands its
@@ -3255,6 +3291,7 @@ impl OracleVerifier {
             now,
             max_data_age,
             );
+            Self::record_reading_timestamp(&env, &data_type, &sub.key, &oracle, sub.timestamp);
 
             env.events().publish(
                 (Symbol::new(&env, "oracle_data_submitted"),),
@@ -3421,6 +3458,52 @@ impl OracleVerifier {
         if buf[0] != b'C' {
             panic_with_error!(env, Error::InvalidAddress);
         }
+    }
+
+    /// Issue #775: panic with `StaleReadingTimestamp` if this `oracle` has
+    /// already published a reading for `(data_type, key)` whose timestamp is
+    /// greater than or equal to `new_timestamp`. First submission (no prior
+    /// value) is always accepted. Call before `store_plain_reading` so stale
+    /// readings never reach the aggregator.
+    fn require_strictly_newer_reading(
+        env: &Env,
+        data_type: &Symbol,
+        key: &Symbol,
+        oracle: &Address,
+        new_timestamp: u64,
+    ) {
+        let storage_key = StorageKey::LastReadingTimestamp(
+            data_type.clone(),
+            key.clone(),
+            oracle.clone(),
+        );
+        if let Some(last) = env.storage().persistent().get::<_, u64>(&storage_key) {
+            if new_timestamp <= last {
+                panic_with_error!(env, Error::StaleReadingTimestamp);
+            }
+        }
+    }
+
+    /// Issue #775: record the accepted reading's timestamp as the oracle's
+    /// new high-water mark for this stream. Only called after every other
+    /// gate accepts the submission so a rejected reading does not advance
+    /// the monotonic guard and let a later legitimate reading be rejected.
+    fn record_reading_timestamp(
+        env: &Env,
+        data_type: &Symbol,
+        key: &Symbol,
+        oracle: &Address,
+        timestamp: u64,
+    ) {
+        let storage_key = StorageKey::LastReadingTimestamp(
+            data_type.clone(),
+            key.clone(),
+            oracle.clone(),
+        );
+        env.storage().persistent().set(&storage_key, &timestamp);
+        env.storage()
+            .persistent()
+            .extend_ttl(&storage_key, TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     /// Enforce the per-oracle submission cooldown for `data_type`: panics with
@@ -4061,3 +4144,6 @@ mod test_advanced;
 mod test_offline;
 #[cfg(test)]
 mod test_confidence_bounds;
+
+#[cfg(test)]
+mod test_monotonic;

@@ -161,6 +161,10 @@ pub enum Error {
     EmptyDescription = 46,
     /// Product description / name is too short (issue #755).
     InvalidDescription = 47,
+    /// Oracle `data_type` is not registered on the oracle verifier.
+    UnregisteredOracleDataType = 48,
+    /// Generic rejected input — malformed, out of range, or wrong type.
+    InvalidInput = 49,
 }
 
 // SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
@@ -468,7 +472,8 @@ impl PolicyEngine {
             let sym_val = params.name.to_symbol_val();
             let sym_str: Result<SymbolStr, _> = SymbolStr::try_from_val(&env, &sym_val);
             if let Ok(s) = sym_str {
-                let bytes: &[u8] = s.as_ref().as_bytes();
+                let s_str: &str = s.as_ref();
+                let bytes: &[u8] = s_str.as_bytes();
                 if bytes.is_empty() {
                     panic_with_error!(&env, Error::EmptyDescription);
                 }
@@ -1953,6 +1958,44 @@ impl PolicyEngine {
     /// Upgrade the contract WASM in-place. Only the admin may call this.
     /// Storage is preserved across upgrades; only the execution code changes.
     /// Runs storage migrations if the new version requires them.
+    ///
+    /// Upgrade state-preservation guarantees (issue #777).
+    ///
+    /// Soroban's `env.deployer().update_current_contract_wasm` swaps the
+    /// contract's code without touching its storage. Every entry in
+    /// `env.storage().instance()`, `env.storage().persistent()`, and
+    /// `env.storage().temporary()` survives the swap, so existing policies,
+    /// products, and pending-oracle-change records remain readable by the
+    /// new WASM.
+    ///
+    /// Policy data (`StorageKey::Policy(id)`, `StorageKey::PolicyIds`,
+    /// `StorageKey::Product(id)`, `StorageKey::ProductIds`) is persistent
+    /// and is never removed by this function. Any schema change that
+    /// requires rewriting existing policies must land as a new migration
+    /// in `run_migrations` (see `migrate_v1_to_v2` for the pattern) so a
+    /// freshly-upgraded WASM can read legacy entries.
+    ///
+    /// Order of operations is deliberate:
+    /// 1. Migrations run against the old-WASM storage layout.
+    /// 2. The stored version is stamped.
+    /// 3. The WASM is swapped.
+    ///
+    /// Running migrations before the swap means the new WASM never
+    /// observes an un-migrated entry; stamping the version before the
+    /// swap means a subsequent upgrade sees the correct current_version.
+    ///
+    /// Upgrade procedure for operators:
+    /// - Deploy a new WASM blob to Stellar and record its `BytesN<32>`
+    ///   hash.
+    /// - Guardians approve the upgrade (if `GuardianThreshold > 0`;
+    ///   mirrors the risk-pool approval flow — admin alone can trigger
+    ///   when guardians are disabled).
+    /// - Admin calls `upgrade(admin, new_wasm_hash, new_version)` with
+    ///   the next sequential version number.
+    /// - After the transaction commits, confirm `get_version()` reports
+    ///   the new value and spot-check that `get_policy(id)` is readable
+    ///   for a representative policy id — the three-step order above
+    ///   guarantees it, but a sanity check costs nothing.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>, new_version: u32) {
         Self::require_admin(&env, &admin);
         let current_version: u32 = env
