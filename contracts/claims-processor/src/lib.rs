@@ -2223,6 +2223,18 @@ impl ClaimsProcessor {
         Self::claim_payout(env, claim_id)
     }
 
+    /// Claim payout with explicit recipient verification (issue #718).
+    /// Rejects any attempt to redirect payout away from the claimant.
+    pub fn claim_payout_to(env: Env, claim_id: u128, recipient: Address) -> i128 {
+        let claim: Claim = env.storage().persistent()
+            .get(&StorageKey::Claim(claim_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
+        if recipient != claim.claimant {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        Self::claim_payout(env, claim_id)
+    }
+
     /// Claim the payout for an approved claim after the payout delay has elapsed.
     ///
     /// When a payout delay is configured, approved claims enter Paid/PartiallyPaid
